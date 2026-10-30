@@ -95,7 +95,7 @@ public partial class Main : Node
             "点击画面捕获鼠标 | ESC 释放\n" +
             "WASD 移动 / Space 上升 / Ctrl 下降 / Shift 加速\n" +
             "左键 删除方块 | 右键 放置方块 | T 切换材质\n" +
-            "1 泳池 | 2 康奈尔盒 | R 重置相机 | M 水面动画\n" +
+            "1 泳池 | 2 康奈尔盒 | 3 后室 | 4 展厅 | R 重置相机 | M 水面动画\n" +
             "F5 保存 | F9 读取 | E 自动曝光 | PageUp/Down 渲染比例\n" +
             "[ ] 太阳高度 | - = 太阳方位（黄昏/夜晚有星空）";
 
@@ -128,6 +128,8 @@ public partial class Main : Node
             LoadPreset(1);
         else if (System.Environment.GetEnvironmentVariable("VOXELPRESET") == "2")
             LoadPreset(2);
+        else if (System.Environment.GetEnvironmentVariable("VOXELPRESET") == "3")
+            LoadPreset(3);
         if (System.Environment.GetEnvironmentVariable("VOXELGI") == "0")
             _giCache = false;
         if (float.TryParse(System.Environment.GetEnvironmentVariable("VOXELSUNELEV"),
@@ -271,7 +273,8 @@ public partial class Main : Node
         _preset = index;
         if (index == 0) _world.BuildPool();
         else if (index == 1) _world.BuildCornell();
-        else _world.BuildBackrooms();
+        else if (index == 2) _world.BuildBackrooms();
+        else _world.BuildShowroom();
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
         _pt.ResetExposure(_world.Scene.Exposure);
@@ -471,6 +474,7 @@ public partial class Main : Node
                 case Key.Key1: LoadPreset(0); break;
                 case Key.Key2: LoadPreset(1); break;
                 case Key.Key3: LoadPreset(2); break;
+                case Key.Key4: LoadPreset(3); break;
                 case Key.R:
                     _cam.SetSpawn(_world.Scene.SpawnPos, _world.Scene.SpawnYaw, _world.Scene.SpawnPitch);
                     _sampleIdx = 0;

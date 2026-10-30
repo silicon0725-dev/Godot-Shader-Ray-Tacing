@@ -37,6 +37,10 @@ public static class MatId
     public const byte CyanLight = 23;
     public const byte MagentaLight = 24;
     public const byte YellowLight = 25;
+    // 展厅/车辆
+    public const byte Tire = 26;
+    public const byte PaintNavy = 27;
+    public const byte PaintBlue = 28;
 }
 
 /// <summary>材质/球体类型常量（与 GLSL 一致）</summary>
@@ -106,7 +110,7 @@ public partial class VoxelWorld : Node
     public float[] BuildMaterialBuffer()
     {
         // 20 个材质槽（0..16 被占用）
-        var m = new float[28 * 8];   // 0..25 被占用
+        var m = new float[32 * 8];   // 0..28 被占用
         void Set(int id, Vector4 alb, Vector4 em)
         {
             m[id * 8 + 0] = alb.X; m[id * 8 + 1] = alb.Y; m[id * 8 + 2] = alb.Z; m[id * 8 + 3] = alb.W;
@@ -144,6 +148,10 @@ public partial class VoxelWorld : Node
         Set(MatId.CyanLight,    new Vector4(0, 0, 0, 1), new Vector4(0.16f, 3.4f, 4.0f, MatType.Emissive));
         Set(MatId.MagentaLight, new Vector4(0, 0, 0, 1), new Vector4(4.0f, 0.20f, 3.0f, MatType.Emissive));
         Set(MatId.YellowLight,  new Vector4(0, 0, 0, 1), new Vector4(4.0f, 3.7f, 0.72f, MatType.Emissive));
+        // 展厅/车辆材质
+        Set(MatId.Tire,      new Vector4(0.07f, 0.07f, 0.08f, 0.95f), new Vector4(0, 0, 0, MatType.Diffuse));
+        Set(MatId.PaintNavy, new Vector4(0.05f, 0.06f, 0.12f, 0.22f), new Vector4(0, 0, 0, MatType.Diffuse));
+        Set(MatId.PaintBlue, new Vector4(0.06f, 0.12f, 0.78f, 0.22f), new Vector4(0, 0, 0, MatType.Diffuse));
         return m;
     }
 
@@ -403,6 +411,139 @@ public partial class VoxelWorld : Node
     /// 后室：黄壁纸办公迷宫——地毯地面、吊顶天花、网格状荧光灯板（部分坏灯闪烁）。
     /// 墙网 x/z mod 9 + 哈希门洞，形成 ~7 格的房间与走廊。
     /// </summary>
+    // ======================================================================
+    //  体素化布加迪（用户提供的模型离线体素化：1103 体素，16宽×8高×27长，
+    //  每项 4 字节 x,y,z,调色板索引；调色板映射到引擎材质）
+    // ======================================================================
+    private const int CarW = 16, CarH = 8, CarL = 27;
+    // 车体数据从 assets/car_voxel.b64 读取（避免大常量转录损坏）
+    private static string CarB64()
+    {
+        string s = FileAccess.GetFileAsString("res://assets/car_voxel.b64");
+        return s.Trim();
+    }
+    private static string _carB64Unused =
+            "AAADBgAABAYAAAUDAAAGAgAABwIAAAgDAAAJBgAACgYAAQIGAAEDBAABBAMAAQUCAAEGAgABBwIAAQgDAAEJBgABCgYAAgMEAAIE" +
+            "AwACBQIAAgYCAAIHAgACCAMAAgkGAAMDBAADBAMAAwUCAAMGAgADBwIAAwgDAAMJBgAEAwQABAQGAAQFBgAEBgMABAcDAAQIBgAF" +
+            "AgYABQMGAQACBQEAAwYBAAQDAQAFAgEABgIBAAcCAQAIAwEACgYBAAsGAQAMBgEADQYBAA4GAQAPBgEAEAYBABEGAQEBBgEBAgQB" +
+            "AQMEAQEEAwEBBQIBAQYCAQEHAgEBCAMBAQkGAQEKBwEBCwcBAQwEAQENBAEBDgQBAQ8EAQEQBAECAgQBAgMEAQIEAwECBQIBAgYC" +
+            "AQIHAgECCAMBAgkHAQIKBAECCwQBAgwEAQINBAEDAgABAwMAAQMEAwEDBQIBAwYCAQMHAgEDCAMBAwkEAQMKBAEDCwcBBAIEAQQD" +
+            "BAEEBAYBBAUDAQQGAwEEBwMBBAgGAQQJBAEECgQBBBEEAQQSBwEFAQYBBQIGAQUDBgEFBAYBBQUGAQUGBgEFBwYBBQgGAQUJBAEF" +
+            "CgQBBREEAQUSBgIAAgUCAAMFAgAEBQIABQMCAAYDAgAHAwIACAMCAA8GAgAQBgIAEQYCABIGAgATAwIAFAMCABUDAgAWAwIAFwMC" +
+            "AQEGAgECBAIBAwMCAQQDAgEFAwIBBgMCAQcDAgEIAwIBCwcCAQwHAgENBwIBDgcCAQ8HAgEQBAIBEQQCARIEAgETAwIBFAMCARUD" +
+            "AgEWAwIBFwMCAgEGAgICBAICAwMCAgQDAgIFAwICBgMCAgcDAgIIAwICCwcCAgwHAgINBwICDgcCAg8HAgIQBwICEQcCAhIHAgIT" +
+            "AwICFAMCAhUDAgIWAwICFwMCAwEAAgMCAAIDAwACAwQDAgMFAwIDBgMCAwcDAgMIAwIDCQcCAwoHAgMLBwIDDAcCAw0HAgMOBwID" +
+            "DwcCAxAHAgMRBwIDEgcCAxMDAgMUAwIDFQMCAxYDAgMXAwIEAQYCBAIEAgQDBgIEBAYCBAUDAgQGAwIEBwMCBAgFAgQJBwIECgcC" +
+            "BAsHAgQMBwIEDQcCBA4HAgQPBwIEEAcCBBEEAgQSBwIEEwcCBBQHAgQVBwIFAAYCBQEGAgUCBgIFBAYCBQUGAgUGBgIFBwYCBQgG" +
+            "AgUJBAIFCgQCBQsEAgURBAIFEgQCBgoGAgYLBAMAAQUDAAIFAwADBQMABQMDAAYDAwAHAwMACAMDABMDAwAUAgMAFQIDABYDAwAX" +
+            "AwMAGAQDAQAFAwEBBgMBAgYDAQMFAwEFAwMBBgMDAQcDAwEIAwMBEwMDARQCAwEVAgMBFgIDARcDAwEYBAMCAQYDAgIGAwIFAwMC" +
+            "BgMDAgcDAwIIAwMCEwMDAhQCAwIVAgMCFgIDAhcDAwIYBAMDAQADAwIAAwMFAwMDBgMDAwcDAwMIAwMDEgcDAxMDAwMUAgMDFQID" +
+            "AxYCAwMXAwMDGAcDBAEGAwQCBAMEAwYDBAQGAwQFAwMEBgMDBAcDAwQIBAMECQUDBAoFAwQLBQMEDAADBA0AAwQOAAMEDwADBBAA" +
+            "AwQRAAMEEgADBBMAAwQUAwMEFQMDBBYHAwQXBwMFAAYDBQEGAwUCBgMFBAYDBQUGAwUGBgMFBwQDBQgGAwUJBgMFCgYDBQsAAwUM" +
+            "AAMFDQADBQ4AAwUPAAMFEAADBREAAwUSBwMGCAYDBgkGAwYKBgMGCwADBgwAAwYNAAMGDgQDBg8EBAABBQQAAgUEABMDBAAUAgQA" +
+            "FQIEABYDBAAXAwQAGAQEABkGBAEABgQBAQYEAQIGBAEDBQQBBAUEAQUFBAETAwQBFAIEARUCBAEWAgQBFwMEARgEBAIABgQCAQQE" +
+            "AhMDBAIUAgQCFQIEAhYCBAIXAwQCGAQEAhkHBAMBAAQDAgAEAwYEBAMHBAQDEwMEAxQCBAMVAgQDFgIEAxcBBAMYAQQEAQYEBAIG" +
+            "BAQDBgQEBAYEBAUGBAQGBAQEBwQEBAgEBAQJBAQECgQEBBIABAQTAAQEFAMEBBUDBAQWAwQEFwcEBQAGBAUBBgQFAgYEBQcEBAUI" +
+            "BAQFCQQEBQoEBAUOAAQFDwAEBRAABAURAAQFEgAEBggGBAYJBAQGCgQEBgsABAYMAAQGDQAEBg4ABAYPAAQGEAYFAAEFBQACBQUA" +
+            "FAMFABUDBQAWAwUAFwMFABgEBQAZBgUBAAYFAQEGBQECBgUBAwUFAQQFBQEFBQUBBgUFAQcFBQEUAwUBFQMFARYDBQEXAwUBGAQF" +
+            "ARkEBQIABgUCAQQFAhQDBQIVAwUCFgMFAhcDBQIYAAUCGQcFAwAABQMBAAUDAgAFAwYEBQMHBAUDFAMFAxUDBQMWAwUDFwEFAxgB" +
+            "BQQBBAUEAgYFBAMGBQQEBgUEBQYFBAYEBQQHBAUECAQFBAkEBQQKBAUEEgAFBBMABQQUAAUEFQMFBBYHBQQXBwUFAAYFBQEGBQUD" +
+            "BgUFBAYFBQUGBQUGBgUFBwQFBQgEBQUJBAUFCgQFBRAABQURAAUFEgAFBgcGBQYIBgUGCQQFBgoEBQYLBgUGDAYFBg0GBQYOBgUG" +
+            "DwYFBhAABgABBQYAAgUGABgEBgAZBAYBAAYGAQEGBgECBgYBAwUGAQQFBgEFBQYBBgUGAQcFBgEYBAYBGQQGAgAGBgIBBgYCFwAG" +
+            "AhgBBgIZBAYDAAAGAwEABgMCAAYDBgQGAwcEBgMXAQYDGAEGBAEGBgQCBgYEAwYGBAQGBgQFBAYEBgQGBAcEBgQIBAYECQQGBAoE" +
+            "BgQSAAYEEwAGBBQABgQVBwYEFgcGBBcHBgUABgYFAQYGBQQGBgUFBgYFBgQGBQcEBgUIBAYFCQQGBQoEBgUQAAYFEQAGBRIABgUT" +
+            "AAYGBgYGBgcGBgYIBgYGCQQGBgoGBgYLBgYGDAYGBg0GBgYOBgYGDwYGBhAABwABBQcAAgUHABgEBwAZBAcBAAYHAQEEBwECBQcB" +
+            "BQUHAQYFBwEHBQcBGAQHARkEBwIABgcCAQQHAhgEBwIZBAcDAAAHAwEABwMCAAcDBQQHAwYEBwMHBAcDGAcHAxkHBwQABQcEAQQH" +
+            "BAIGBwQDBgcEBAYHBAUEBwQGBAcEBwQHBAgEBwQJBAcECgQHBBMABwQUAAcEFQcHBBYHBwQXBwcEGAcHBQAGBwUBBgcFBgQHBQcE" +
+            "BwUIBAcFCQQHBQoEBwUPAAcFEAAHBREABwUSAAcFEwAHBgcGBwYIBgcGCQQHBgoGBwYLBgcGDAYHBg0GBgYOBgcGDwAHBhAACAAB" +
+            "BQgAAgUIAAMDCAAEAwgABQMIABkECAEABggBAQQIAQIDCAEDAwgBBAMIAQUDCAEYBAgBGQQIARoECAIABggCAQQIAgIDCAIDAwgC" +
+            "BAMIAgUDCAIYBAgCGQQIAwAACAMBAAgDAgAIAwMDCAMEAwgDBQMIAwYECAMHBAgDGAQIAxkECAQBBAgEAgYIBAMGCAQEAwgEBQMI" +
+            "BAYECAQHBAgECAQIBAkECAQSAAgEEwAIBBQACAQVBwgEFgcIBBcHCAQYBwgFAAYIBQEGCAUDBggFBAYIBQUGCAUGBAgFBwQIBQgE" +
+            "CAUJBAgFDwAIBRAACAURAAgFEgAIBgcGCAYIBggGCQQIBgoGCAYLBggGDAYIBg0GCAYOBggGDwAJAAEGCQACAwkAAwMJAAQDCQAF" +
+            "AwkABgMJAAcDCQAZBAkBAAYJAQEECQECAwkBAwMJAQQDCQEFAwkBBgMJAQcDCQEZBAkCAQQJAgIDCQIDAwkCBAMJAgUDCQIGAwkC" +
+            "BwMJAhkECQMBAAkDAgAJAwMDCQMEAwkDBQMJAwYDCQMHAwkDGAQJAxkECQQBBAkEAgYJBAMDCQQEAwkEBQMJBAYDCQQHBQkECAQJ" +
+            "BAkECQQSAAkEEwAJBBQFCQQVBwkEFgcJBBcHCQQYJwkFAAYJBQEGCQUDBgkFBAYJBQUGCQUGBgkFBwYJBQgECQUJBAkFCgUJBQ8A" +
+            "CQUQAAkFEQAJBRIACQYHBgkGCAYJBgkGCQYKAAkGCwAJBgwGCQYNBgkGDgYJBg8GCgABBgoAAgYKAAMDCgAEAgoABQIKAAYDCgAH" +
+            "AwoAGAQKABkECgEBBAoBAgMKAQMCCgEEAgoBBQIKAQYCCgEHAwoBGAQKARkECgIBBAoCAgMKAgMCCgIEAgoCBQIKAgYCCgIHAwoC" +
+            "GAQKAhkECgMBBAoDAgMKAwMDCgMEAgoDBQIKAwYDCgMHAwoDFwcKAxgECgMZBAoEAQQKBAIGCgQDAwoEBAMKBAUDCgQGAwoEBwcK" +
+            "BAgHCgQJBwoECgcKBAsACgQRAAoEEgAKBBMACgQUBwoEFQcKBBYHCgQXBwoFAQYKBQMGCgUEBgoFBQYKBQYGCgUHBgoFCAQKBQkE" +
+            "CgUKAAoFCwAKBQwACgUNAAoFDgAKBQ8ACgUQAAoFEQAKBRIACgYIBgoGCQYKBgoACgYLAAoGDAAKBg0ACgYOBgoGDwYLAAMDCwAE" +
+            "AgsABQILAAYDCwAHAwsAEQMLABIDCwATAwsAFwQLABgECwECAwsBAwILAQQCCwEFAgsBBgILAQcDCwEIBQsBCQcLAQoHCwELBwsB" +
+            "EQMLARIDCwETAwsBFAMLARcECwEYBAsBGQQLAgIDCwIDAgsCBAILAgUCCwIGAgsCBwMLAggHCwIJBwsCCgcLAgsHCwIRAwsCEgML" +
+            "AhMDCwIUAwsCFgALAhcBCwIYBAsCGQcLAwIGCwMDAwsDBAILAwUCCwMGAwsDBwcLAwgECwMJBwsDCgcLAwsHCwMSAwsDEwMLAxQD" +
+            "CwMWAQsDFwELAxgHCwQCBgsEAwYLBAQDCwQFAwsEBgYLBAcECwQIBAsECQcLBAoHCwQLAAsEDAALBA0ACwQOAAsEDwALBBAACwQR" +
+            "AAsEEgALBBMACwQUBwsEFQcLBBYHCwQXBwsFBgYLBQcGCwUIBAsFCQQLBQsACwUMAAsFDQALBQ4ACwUPAAsFEAALBREACwYLBAsG" +
+            "DAQLBg0ECwYOBgsGDwYMAAYDDAAHBgwACAYMAAkGDAAKBgwACwYMAAwGDAARAwwAEgMMABMDDAAUAwwAFQMMABYGDAAXBAwAGAYM" +
+            "AQYDDAEHBgwBCAYMAQkGDAEKBAwBCwQMAQwEDAENBwwBDgcMAREDDAESAwwBEwMMARQDDAEVAwwBFgMMARcEDAEYBAwCBgMMAgcG" +
+            "DAIIBAwCCQQMAgoEDAILBAwCDAcMAg0HDAIOBwwCEQMMAhIDDAITAwwCFAMMAhUDDAIWAAwCFwEMAhgHDAMGAwwDCAQMAwoHDAML" +
+            "BwwDDAcMAw0HDAMOBwwDDwcMAxEDDAMSAwwDEwMMAxQDDAMVAwwDFgEMAxcBDAQLBwwEDAcMBA0HDAQOAAwEDwAMBBAADAQRAAwE" +
+            "EgcMBBMDDAQUAwwEFQcMBBYHDAUPBAwFEAANAAsGDQAMBg0ADQYNAA4GDQAPBg0AEAYNABEDDQASAg0AEwINABQCDQAVAw0AFgQN" +
+            "ARcEDQEMBA0BDQQNAQ4EDQEPBA0BEAQNAREDDQESAg0BEwINARQCDQEVAw0BFgQNARcEDQIOBw0CDwcNAhAHDQIRAw0CEgINAhMC" +
+            "DQIUAg0CFQMNAhYDDQIXAw0DDgcNAw8HDQMQBw0DEQMNAxICDQMTAg0DFAINAxUBDQMWAQ0DFwANBA8EDQQQBA0EEQcNBBIHDQQT" +
+            "Aw0EFAMNBBUHDQQWBw0FDwQNBRAEDgARAw4AEgMOABMDDgAUAw4AFQMOABYEDgERAw4BEgMOARMDDgEUAw4BFQMOARYEDgIRAw4C" +
+            "EgMOAhMDDgIUAw4CFQMOAhYEDgIXBw4DEQMOAxIDDgMTAw4DFAMOAxUDDgMWBw4EDwQOBBMHDgQUBw4EFQc=";
+
+    /// <summary>调色板索引 → 引擎材质 id（0 玻璃 1 前灯 2 尾灯 3 胎 4 镀铬 5 灰 6/7 车漆）</summary>
+    private static byte[] CarPalette => new byte[]
+    {
+        MatId.GlassWhite, MatId.EmissiveBlock, MatId.RedLight, MatId.Tire,
+        MatId.Metal, MatId.Stone, MatId.PaintNavy, MatId.PaintBlue,
+    };
+
+    /// <summary>放置体素车（车长沿世界 X 轴：模型 (x,y,z) → 世界 (z,y,x)）</summary>
+    private void AddCar(int ox, int oy, int oz)
+    {
+        byte[] data = System.Convert.FromBase64String(CarB64());
+        var pal = CarPalette;
+        for (int i = 0; i + 3 < data.Length; i += 4)
+        {
+            int mx = data[i], my = data[i + 1], mz = data[i + 2];
+            int wx = ox + mz, wy = oy + my, wz = oz + (CarW - 1 - mx);
+            if (InBounds(wx, wy, wz))
+                this[wx, wy, wz] = pal[data[i + 3]];
+        }
+    }
+
+    /// <summary>展厅预设：黑亮地板 + 三色摄影灯 + 体素超跑</summary>
+    public void BuildShowroom()
+    {
+        Array.Clear(Voxels, 0, Voxels.Length);
+        // 光亮深色地板（藏青车漆材质当镜面地板）+ 环形衬底
+        for (int x = 1; x < 31; x++)
+            for (int z = 1; z < 31; z++)
+                this[x, 0, z] = ((x - 16) * (x - 16) + (z - 16) * (z - 16) <= 14 * 14)
+                              ? MatId.PaintNavy : MatId.Stone;
+
+        // 车：长 27 沿 X → x 3..29，宽 16 沿 Z → z 8..23，底 y=1
+        AddCar(3, 1, 8);
+
+        Scene = new SceneDef
+        {
+            Name = "展厅 Showroom",
+            SpawnPos = new Vector3(16f, 7.5f, 28.5f),
+            SpawnYaw = 0f,
+            SpawnPitch = -0.10f,
+            SunDir = new Vector3(0.3f, 0.7f, 0.35f).Normalized(),
+            SunIntensity = 1.2f,
+            SunColor = new Color(1f, 0.97f, 0.92f),
+            SkyIntensity = 0.35f,
+            Exposure = 1.0f,
+            SunOn = true,
+            WaterY = -1000f,
+        };
+
+        // 三色摄影灯球（NEE 区域光）
+        Spheres = new SphereDef[]
+        {
+            new() { Pos = new Vector3(8f, 12f, 10f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(0.4f, 3.6f, 4.4f) },
+            new() { Pos = new Vector3(24f, 13f, 10f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(4.4f, 0.5f, 3.2f) },
+            new() { Pos = new Vector3(16f, 14f, 22f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(4.6f, 4.4f, 4.0f) },
+        };
+    }
+
     public void BuildBackrooms()
     {
         Array.Clear(Voxels, 0, Voxels.Length);
