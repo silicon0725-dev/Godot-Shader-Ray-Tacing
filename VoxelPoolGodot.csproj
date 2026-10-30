@@ -1,0 +1,10 @@
+<Project Sdk="Godot.NET.Sdk/4.7.2">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AssemblyName>VoxelPoolGodot</AssemblyName>
+    <RootNamespace>VoxelPoolGodot</RootNamespace>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+</Project>

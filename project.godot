@@ -1,0 +1,29 @@
+; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="VoxelPoolGodot"
+config/description="体素池核风格 WebGPU 演示的 Godot 复刻：体素 DDA 路径追踪 + 焦散光子映射"
+run/main_scene="res://scenes/main.tscn"
+config/features=PackedStringArray("4.7", "C#")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+
+[dotnet]
+
+project/assembly_name="VoxelPoolGodot"
+
+[rendering]
+
+renderer/rendering_method.mobile="forward_plus"

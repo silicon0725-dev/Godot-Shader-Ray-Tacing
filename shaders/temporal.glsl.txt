@@ -1,0 +1,78 @@
+#version 450
+// ============================================================================
+//  temporal.glsl — 时间重投影（TAA 式历史复用，借鉴原版 reflection history）
+//  移动时：本帧采样(cur) 与上一帧历史(hist) 按世界坐标重投影混合，
+//  水面/瓷砖等光面路径在移动中保持平滑；静止后无缝切回纯累积。
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    vec4 uCamPos; vec4 uCamRight; vec4 uCamUp; vec4 uCamFwd;
+    vec4 uRes; vec4 uFrame; vec4 uSun; vec4 uSunColor;
+    vec4 uSkyWater; vec4 uPoolWorld; vec4 uMisc; vec4 uSelect;
+    vec4 uExposure;
+    vec4 uTemporal;   // x=moving, y=alpha, z=spp, w=首帧(无历史)
+    vec4 uPrevPos; vec4 uPrevRight; vec4 uPrevUp; vec4 uPrevFwd;
+} P;
+
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D frameImg;   // 本帧辐射/spp
+layout(set = 0, binding = 2, rgba16f) readonly uniform image2D posImg;     // 主命中世界坐标
+layout(set = 0, binding = 3) uniform sampler2D histSmp;                    // 上一帧历史
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D histNew;   // 新历史
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image2D accumImg;  // 供呈现
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(P.uRes.x) || pix.y >= int(P.uRes.y)) return;
+
+    float invSpp = 1.0 / max(P.uTemporal.z, 1.0);
+    vec3 cur = imageLoad(frameImg, pix).rgb * invSpp;
+
+    // 本帧 3×3 邻域颜色盒（标准 TAA 邻域钳制，抑制镜面/遮挡重影）
+    vec4 posHit = imageLoad(posImg, pix);
+    vec3 cMin = cur, cMax = cur;
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0),
+                            ivec2(int(P.uRes.x) - 1, int(P.uRes.y) - 1));
+            vec3 n = imageLoad(frameImg, q).rgb * invSpp;
+            cMin = min(cMin, n);
+            cMax = max(cMax, n);
+        }
+    }
+    // 放宽 40%（保留时域平滑，避免过锐/闪烁）
+    vec3 cMean = (cMin + cMax) * 0.5;
+    vec3 cExt = (cMax - cMin) * 0.5 * 1.4 + vec3(0.02);
+    cMin = cMean - cExt;
+    cMax = cMean + cExt;
+
+    // 世界坐标 → 上一帧屏幕坐标。
+    // 相机基带 tan(fov)/aspect 缩放（与光线生成一致），反解必须按基长度归一：
+    // d = a·R + b·U + c·F → uv = (a/c, b/c)，其中 a=dot(d,R)/|R|² 等。
+    vec3 d = posHit.xyz - P.uPrevPos.xyz;
+    float z = dot(d, P.uPrevFwd.xyz);
+    float alpha = P.uTemporal.y;
+    // 镜面/折射路径（posImg.w 标记）：内容随视角变化快 → 提高本帧权重防拖影
+    if (posHit.w > 0.5) alpha = max(alpha, 0.45);
+    vec3 outC = cur;
+    if (z > 0.05 && P.uTemporal.w < 0.5) {
+        float kF = dot(P.uPrevFwd.xyz, P.uPrevFwd.xyz);      // |F|²
+        vec2 ndc = vec2(
+            dot(d, P.uPrevRight.xyz) / z * (kF / dot(P.uPrevRight.xyz, P.uPrevRight.xyz)),
+            dot(d, P.uPrevUp.xyz)    / z * (kF / dot(P.uPrevUp.xyz, P.uPrevUp.xyz)));
+        vec2 uvN = vec2((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
+        if (all(greaterThan(uvN, vec2(0.0))) && all(lessThan(uvN, vec2(1.0)))) {
+            vec3 hist = texture(histSmp, uvN).rgb;
+            // 历史异常（NaN/远偏亮）保护
+            if (!any(isnan(hist)) && !any(isinf(hist)) &&
+                max(max(hist.r, hist.g), hist.b) < 60.0) {
+                // 钳制到本帧邻域盒：内容变化（反射变了/遮挡露出）时拒绝旧历史
+                hist = clamp(hist, cMin, cMax);
+                outC = mix(hist, cur, alpha);
+            }
+        }
+    }
+    imageStore(histNew, pix, vec4(outC, 1.0));
+    imageStore(accumImg, pix, vec4(outC, 1.0));
+}

@@ -1,0 +1,50 @@
+#version 450
+// ============================================================================
+//  exposure_finalize.glsl — 自动曝光第二步（单工作组）
+//  汇总所有块槽位 → 几何平均亮度 → 目标曝光 = key / avgL
+//  当前曝光向目标指数逼近（人眼适应，~0.5s）
+// ============================================================================
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    vec4 uCamPos; vec4 uCamRight; vec4 uCamUp; vec4 uCamFwd;
+    vec4 uRes; vec4 uFrame; vec4 uSun; vec4 uSunColor;
+    vec4 uSkyWater; vec4 uPoolWorld; vec4 uMisc; vec4 uSelect;
+    vec4 uExposure;   // x=autoOn, y=keyValue
+} P;
+
+layout(set = 0, binding = 1, std430) buffer LumBuf { float tileLum[]; };
+layout(set = 0, binding = 2, std430) buffer ExBuf { float exposureData[]; };
+
+shared float shSum[64];
+
+void main() {
+    uint lid = gl_LocalInvocationIndex;
+    // 槽位总数（与 reduce 的网格一致）
+    uint nx = (uint(P.uRes.x) + 15u) / 16u;
+    uint ny = (uint(P.uRes.y) + 15u) / 16u;
+    uint count = nx * ny;
+
+    float part = 0.0;
+    for (uint i = lid; i < count; i += 64u) part += tileLum[i];
+    shSum[lid] = part;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (lid < s) shSum[lid] += shSum[lid + s];
+        barrier();
+    }
+
+    if (lid == 0u) {
+        float avgLogL = shSum[0] / float(count);
+        float geomL = exp(avgLogL);                       // 几何平均亮度
+        float key = max(P.uExposure.y, 0.01);
+        // 上限收紧到 5：夜间场景保持昏暗观感（星星/发光体突出），
+        // 而不是被满增益拉成白天
+        float target = clamp(key / max(geomL, 1e-5), 0.05, 5.0);
+        float cur = exposureData[0];
+        exposureData[0] = cur + (target - cur) * 0.06;    // 人眼适应速率
+        exposureData[1] = target;
+        exposureData[2] = geomL;                          // 调试用
+    }
+}

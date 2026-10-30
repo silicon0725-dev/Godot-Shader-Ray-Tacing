@@ -1,0 +1,40 @@
+#version 450
+// ============================================================================
+//  exposure_reduce.glsl — 分块 log 亮度归约（自动曝光第一步）
+//  每个 16×16 工作组算出块内平均 log 亮度，写入对应槽位（无原子操作）
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    vec4 uCamPos; vec4 uCamRight; vec4 uCamUp; vec4 uCamFwd;
+    vec4 uRes; vec4 uFrame; vec4 uSun; vec4 uSunColor;
+    vec4 uSkyWater; vec4 uPoolWorld; vec4 uMisc; vec4 uSelect;
+} P;
+
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D accumImg;
+layout(set = 0, binding = 2, std430) buffer LumBuf { float tileLum[]; };
+
+shared float shLog[256];
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    float L = 1e-5;
+    if (pix.x < int(P.uRes.x) && pix.y < int(P.uRes.y)) {
+        vec3 c = imageLoad(accumImg, pix).rgb / max(P.uFrame.x, 1.0);
+        L = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
+    }
+    uint lid = gl_LocalInvocationIndex;
+    shLog[lid] = log(L);
+    barrier();
+    // 树归约
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lid < s) shLog[lid] += shLog[lid + s];
+        barrier();
+    }
+    if (lid == 0u) {
+        uint gx = gl_WorkGroupID.x, gy = gl_WorkGroupID.y;
+        uint nx = (uint(P.uRes.x) + 15u) / 16u;
+        tileLum[gy * nx + gx] = shLog[0] / 256.0;
+    }
+}

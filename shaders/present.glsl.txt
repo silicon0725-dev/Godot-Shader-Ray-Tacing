@@ -1,0 +1,87 @@
+#version 450
+// ============================================================================
+//  present.glsl — 累积缓冲 → 曝光 → filmic tonemap → gamma → rgba8
+//                + 选中方块描边（准星目标体素的黑框，Minecraft 风格）
+//                + 屏幕中心准星
+// ============================================================================
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    vec4 uCamPos;
+    vec4 uCamRight;
+    vec4 uCamUp;
+    vec4 uCamFwd;
+    vec4 uRes;       // w, h, 1/w, 1/h
+    vec4 uFrame;     // x=sampleIdx(累积帧数), ...
+    vec4 uSun;
+    vec4 uSunColor;  // w=手动曝光
+    vec4 uSkyWater;
+    vec4 uPoolWorld;
+    vec4 uMisc;
+    vec4 uSelect;    // xyz=准星目标体素最小角, w=1 有效
+    vec4 uExposure;  // x=autoOn
+} P;
+
+layout(set = 0, binding = 1, rgba16f) readonly uniform image2D accumImg;
+layout(set = 0, binding = 2, rgba8) writeonly uniform image2D presentImg;
+layout(set = 0, binding = 3, std430) readonly buffer ExBuf { float exposureData[]; };
+
+vec3 tonemap(vec3 x) {
+    // filmic 曲线（自写参数变体）
+    const float a = 2.40, b = 0.030, c = 2.35, d = 0.60, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(P.uRes.x) || pix.y >= int(P.uRes.y)) return;
+
+    vec3 col = imageLoad(accumImg, pix).rgb / max(P.uFrame.x, 1.0);
+    // 曝光：自动（人眼适应，GPU 闭环计算）或场景手动值
+    float exposure = (P.uExposure.x > 0.5 && exposureData.length() > 0u)
+                   ? exposureData[0] : P.uSunColor.w;
+    col *= exposure;
+    col = tonemap(col);
+    col = pow(col, vec3(1.0 / 2.2));            // gamma
+
+    // ---- 选中方块描边（用 UBO 里的相机参数重建本像素光线打体素框）----
+    if (P.uSelect.w > 0.5) {
+        vec2 uv2 = (vec2(pix) + 0.5) * P.uRes.zw * 2.0 - 1.0;
+        uv2.y = -uv2.y;
+        vec3 rdir = normalize(P.uCamFwd.xyz + uv2.x * P.uCamRight.xyz + uv2.y * P.uCamUp.xyz);
+        vec3 ro = P.uCamPos.xyz;
+        vec3 bmin = P.uSelect.xyz;
+        vec3 bmax = bmin + vec3(1.0);
+        vec3 invD = 1.0 / mix(rdir, vec3(1e-10), lessThan(abs(rdir), vec3(1e-10)));
+        vec3 tA = (bmin - ro) * invD;
+        vec3 tB = (bmax - ro) * invD;
+        vec3 tmn = min(tA, tB), tmx = max(tA, tB);
+        float tEnter = max(max(tmn.x, tmn.y), tmn.z);
+        float tExit  = min(min(tmx.x, tmx.y), tmx.z);
+        if (tExit > max(tEnter, 0.0)) {
+            vec3 hp = ro + rdir * max(tEnter, 1e-4);
+            vec3 hrel = clamp(hp - bmin, 0.0, 1.0);
+            // 命中面的两个切向坐标（法线轴 = 提供 tEnter 的轴）
+            vec2 fuv;
+            if (tEnter == tmn.x)      fuv = hrel.zy;
+            else if (tEnter == tmn.y) fuv = hrel.xz;
+            else                      fuv = hrel.xy;
+            vec2 dEdge = min(fuv, 1.0 - fuv);
+            float e = min(dEdge.x, dEdge.y);
+            // 线宽 ~2.5px：世界宽度 ≈ 距离 × 每像素张量
+            float worldPerPx = tEnter * 1.2 / P.uRes.y;
+            float lineW = worldPerPx * 2.5;
+            float mask = 1.0 - smoothstep(lineW, lineW * 2.5, e);
+            col = mix(col, vec3(0.03), mask * 0.85);
+        }
+    }
+
+    // ---- 屏幕中心准星（小十字）----
+    vec2 center = vec2(P.uRes.x, P.uRes.y) * 0.5;
+    vec2 dp = abs(vec2(pix) + 0.5 - center);
+    if (min(dp.x, dp.y) < 1.2 && dp.x + dp.y < 14.0)
+        col = vec3(0.92);
+
+    imageStore(presentImg, pix, vec4(col, 1.0));
+}
