@@ -12,15 +12,17 @@ public partial class PathTracer : IDisposable
 {
     private RenderingDevice _rd;
     private Rid _pathShader, _causticsShader, _clearShader, _presentShader;
-    private Rid _exposureReduceShader, _exposureFinalizeShader, _temporalShader;
+    private Rid _exposureReduceShader, _exposureFinalizeShader, _temporalShader, _bakeShader;
     private Rid _pathPipe, _causticsPipe, _clearPipe, _presentPipe;
-    private Rid _exposureReducePipe, _exposureFinalizePipe, _temporalPipe;
+    private Rid _exposureReducePipe, _exposureFinalizePipe, _temporalPipe, _bakePipe;
 
     private Rid _paramsBuf;                       // 288 字节 UBO
     private Rid _voxelBuf, _sphereBuf, _matBuf;   // 存储缓冲
     private Rid _accumTex, _presentTex, _causticsTex;
     private Rid _giCacheTex, _giSampler;          // GI 辐照缓存（16³ 3D 纹理）
     private Rid _lumBuf, _exposureBuf;            // 自动曝光
+    private Rid _emissiveBuf;                     // 发光体素列表（解析 NEE 面光源）
+    private uint _emissiveCount = 0;
     private Rid _frameTex, _posTex;               // 时间重投影：本帧样本/主命中位置
     private Rid _histA, _histB;                   // 历史双缓冲（ping-pong）
     private bool _histFlip = false;
@@ -28,6 +30,9 @@ public partial class PathTracer : IDisposable
     private Rid _pathSet, _causticsSet, _clearSet, _presentSet;
     private Rid _exposureReduceSet, _exposureFinalizeSet;
     private Rid _temporalSetAB, _temporalSetBA;
+    private Rid _bakeSet;
+    private int _bakePending = 0;       // 待烘焙迭代数
+    private uint _frameTick = 0;
     private int _width = 0, _height = 0;
     public const int CausticsRes = 256;   // 降一档：每纹素光子密度×4，平滑度提升
     public const int PhotonGrid = 256;
@@ -58,10 +63,11 @@ public partial class PathTracer : IDisposable
         _exposureReduceShader = Compile("res://shaders/exposure_reduce.glsl.txt");
         _exposureFinalizeShader = Compile("res://shaders/exposure_finalize.glsl.txt");
         _temporalShader = Compile("res://shaders/temporal.glsl.txt");
+        _bakeShader = Compile("res://shaders/bake.glsl.txt");
         if (!_pathShader.IsValid || !_causticsShader.IsValid ||
             !_clearShader.IsValid || !_presentShader.IsValid ||
             !_exposureReduceShader.IsValid || !_exposureFinalizeShader.IsValid ||
-            !_temporalShader.IsValid)
+            !_temporalShader.IsValid || !_bakeShader.IsValid)
         {
             GD.PushError("着色器编译失败");
             return false;
@@ -74,9 +80,10 @@ public partial class PathTracer : IDisposable
         _exposureReducePipe = _rd.ComputePipelineCreate(_exposureReduceShader);
         _exposureFinalizePipe = _rd.ComputePipelineCreate(_exposureFinalizeShader);
         _temporalPipe = _rd.ComputePipelineCreate(_temporalShader);
+        _bakePipe = _rd.ComputePipelineCreate(_bakeShader);
 
-        // ---- 参数 UBO（18 个 vec4：相机/时间重投影扩展）----
-        _paramsBuf = _rd.UniformBufferCreate(288, new byte[288]);
+        // ---- 参数 UBO（19 个 vec4：相机/时间重投影/烘焙扩展）----
+        _paramsBuf = _rd.UniformBufferCreate(304, new byte[304]);
 
         // ---- 自动曝光缓冲 ----
         _lumBuf = MakeStorageBuffer(new byte[16384 * 4]);       // 块亮度槽位
@@ -99,6 +106,7 @@ public partial class PathTracer : IDisposable
         _voxelBuf = MakeStorageBuffer(new byte[4]);
         _sphereBuf = MakeStorageBuffer(new byte[16]);
         _matBuf = MakeStorageBuffer(new byte[16]);
+        _emissiveBuf = MakeStorageBuffer(new byte[16]);
 
         // ---- 清零 set ----
         _clearSet = MakeSet(_clearShader, 0, new[] {
@@ -118,6 +126,14 @@ public partial class PathTracer : IDisposable
         {
             GD.PushError($"无法读取着色器: {path}");
             return new Rid();
+        }
+        // 简单 #include 解析（res://shaders/ 相对，单层展开）
+        var includeMatches = System.Text.RegularExpressions.Regex.Matches(src, "#include \"([^\"]+)\"");
+        foreach (System.Text.RegularExpressions.Match inc in includeMatches)
+        {
+            string incPath = path.Substring(0, path.LastIndexOf('/') + 1) + inc.Groups[1].Value;
+            string incSrc = FileAccess.GetFileAsString(incPath);
+            src = src.Replace(inc.Value, incSrc);
         }
         var source = new RDShaderSource { SourceCompute = src };
         var spirv = _rd.ShaderCompileSpirVFromSource(source, false);
@@ -195,12 +211,47 @@ public partial class PathTracer : IDisposable
         if (_matBuf.IsValid) _rd.FreeRid(_matBuf);
 
         _voxelBuf = MakeStorageBuffer(voxelWordsPacked);
-        _sphereBuf = MakeStorageBuffer(FloatsToBytes(sphereData));
+        var sphereBytes = FloatsToBytes(sphereData);
+        _sphereBuf = MakeStorageBuffer(sphereBytes.Length > 0 ? sphereBytes : new byte[16]);
         _matBuf = MakeStorageBuffer(FloatsToBytes(matData));
+        BuildEmissiveList(voxelWordsPacked, matData);
         RecreateGiCache();
         RebuildSets();
         ClearCaustics();
+        StartBake(48);   // 预制光照：加载后预收敛 GI 缓存
     }
+
+    /// <summary>扫描体素构建发光体素列表（供解析 NEE 面光源）</summary>
+    private void BuildEmissiveList(byte[] voxelWordsPacked, float[] matData)
+    {
+        if (_emissiveBuf.IsValid) _rd.FreeRid(_emissiveBuf);
+        var list = new System.Collections.Generic.List<float>();
+        int sx = 32, sy = 32, sz = 32;
+        for (int y = 0; y < sy; y++)
+            for (int z = 0; z < sz; z++)
+                for (int x = 0; x < sx; x++)
+                {
+                    int idx = x + y * sx + z * sx * sy;
+                    byte m = voxelWordsPacked[idx];
+                    bool emissive = m == 9 || (m >= 20 && m <= 25);
+                    if (!emissive) continue;
+                    // 中心 + 发光色（材质表 [id*8+4..6]）
+                    list.Add(x + 0.5f); list.Add(y + 0.5f); list.Add(z + 0.5f); list.Add(0);
+                    list.Add(matData[m * 8 + 4]); list.Add(matData[m * 8 + 5]);
+                    list.Add(matData[m * 8 + 6]); list.Add(0);
+                }
+        _emissiveCount = (uint)(list.Count / 8);
+        var data = new byte[list.Count * 4];
+        for (int i = 0; i < list.Count; i++)
+            BitConverter.GetBytes(list[i]).CopyTo(data, i * 4);
+        _emissiveBuf = _emissiveCount > 0 ? MakeStorageBuffer(data)
+                                          : MakeStorageBuffer(new byte[16]);
+    }
+
+    public uint EmissiveCount => _emissiveCount;
+
+    /// <summary>预制光照：排定 N 轮烘焙迭代（每帧最多跑 4 轮）</summary>
+    public void StartBake(int iterations) => _bakePending = Math.Max(_bakePending, iterations);
 
     /// <summary>体素编辑后增量更新（只重传体素缓冲并清焦散）</summary>
     public void UpdateVoxels(byte[] voxelWordsPacked)
@@ -210,6 +261,7 @@ public partial class PathTracer : IDisposable
         RecreateGiCache();
         RebuildSets();
         ClearCaustics();
+        StartBake(32);   // 编辑后重烘
     }
 
     private void RebuildSets()
@@ -229,6 +281,7 @@ public partial class PathTracer : IDisposable
             U(RenderingDevice.UniformType.Image, 7, _giCacheTex),
             U(RenderingDevice.UniformType.Image, 8, _frameTex),
             U(RenderingDevice.UniformType.Image, 9, _posTex),
+            U(RenderingDevice.UniformType.StorageBuffer, 10, _emissiveBuf),
         });
         // 焦散：UBO + 体素 + 焦散图(读写)
         _causticsSet = MakeSet(_causticsShader, 0, new[] {
@@ -258,6 +311,21 @@ public partial class PathTracer : IDisposable
             U(RenderingDevice.UniformType.StorageBuffer, 1, _lumBuf),
             U(RenderingDevice.UniformType.StorageBuffer, 2, _exposureBuf),
         });
+        // 烘焙（与 pathtrace 共用体素/球/材质/焦散/GI缓存）
+        var bakeGiU = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = 6 };
+        bakeGiU.AddId(_giSampler);
+        bakeGiU.AddId(_giCacheTex);
+        _bakeSet = MakeSet(_bakeShader, 0, new[] {
+            U(RenderingDevice.UniformType.UniformBuffer, 0, _paramsBuf),
+            U(RenderingDevice.UniformType.StorageBuffer, 1, _voxelBuf),
+            U(RenderingDevice.UniformType.StorageBuffer, 2, _sphereBuf),
+            U(RenderingDevice.UniformType.StorageBuffer, 3, _matBuf),
+            U(RenderingDevice.UniformType.Image, 5, _causticsTex),
+            bakeGiU,
+            U(RenderingDevice.UniformType.Image, 7, _giCacheTex),
+            U(RenderingDevice.UniformType.StorageBuffer, 10, _emissiveBuf),
+        });
+
         // 时间重投影（两个方向的 ping-pong set 各建一份，运行时切换）
         var thU1 = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = 3 };
         thU1.AddId(_giSampler);
@@ -334,6 +402,16 @@ public partial class PathTracer : IDisposable
             _rd.ComputeListBindUniformSet(cl, _causticsSet, 0);
             _rd.ComputeListDispatch(cl, (uint)(PhotonGrid / 16), (uint)(PhotonGrid / 16), 1);
             _causticsFrames++;
+        }
+        // 预制光照烘焙：待定迭代逐帧消化（每帧 ≤4 轮）+ 每 180 帧微烘 2 轮
+        _frameTick++;
+        if (_frameTick % 180u == 0u && _bakePending == 0) _bakePending = 2;
+        for (int b = 0; b < 4 && _bakePending > 0; b++)
+        {
+            _rd.ComputeListBindComputePipeline(cl, _bakePipe);
+            _rd.ComputeListBindUniformSet(cl, _bakeSet, 0);
+            _rd.ComputeListDispatch(cl, 4, 4, 4);   // 32³ 体素网格（8³/组）
+            _bakePending--;
         }
         _rd.ComputeListBindComputePipeline(cl, _pathPipe);
         _rd.ComputeListBindUniformSet(cl, _pathSet, 0);

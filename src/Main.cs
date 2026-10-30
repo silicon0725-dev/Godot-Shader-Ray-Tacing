@@ -432,6 +432,7 @@ public partial class Main : Node
         V4(_prevRight.X, _prevRight.Y, _prevRight.Z, 0);                                      // uPrevRight
         V4(_prevUp.X, _prevUp.Y, _prevUp.Z, 0);                                               // uPrevUp
         V4(_prevFwd.X, _prevFwd.Y, _prevFwd.Z, 0);                                            // uPrevFwd
+        V4(_pt.EmissiveCount, 0, 0, 0);                                                       // uBake: 发光体素数
         return b.ToArray();
     }
 

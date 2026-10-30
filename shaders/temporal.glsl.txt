@@ -65,9 +65,10 @@ void main() {
         vec2 uvN = vec2((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
         if (all(greaterThan(uvN, vec2(0.0))) && all(lessThan(uvN, vec2(1.0)))) {
             // 速度感知：内容在屏幕上移动越快越要跟手（快速平移时抑制拖影）
+            // 上限 0.6：烘焙后漫反射平滑，无需 0.85 那么激进（过高=裸采样=噪点）
             vec2 curUV = (vec2(pix) + 0.5) * P.uRes.zw;
             float speedPx = length((uvN - curUV) * P.uRes.xy);
-            alpha = clamp(alpha + speedPx * 0.05, alpha, 0.85);
+            alpha = clamp(alpha + speedPx * 0.05, alpha, 0.6);
             vec3 hist = texture(histSmp, uvN).rgb;
             // 历史异常（NaN/远偏亮）保护
             if (!any(isnan(hist)) && !any(isinf(hist)) &&

@@ -1,0 +1,82 @@
+#version 450
+// ============================================================================
+//  bake.glsl — 预制光照烘焙（GI 缓存预收敛）
+//  遍历所有体素的暴露面：直接光用解析 NEE（零方差），间接光用 K 根
+//  余弦射线读上一轮缓存（辐射度迭代）→ 场景加载/编辑后快速收敛，
+//  运行时间接光始终平滑（移动/后室噪点的根治方案）。
+// ============================================================================
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+layout(set = 0, binding = 0, std140) uniform Params {
+    vec4 uCamPos; vec4 uCamRight; vec4 uCamUp; vec4 uCamFwd;
+    vec4 uRes; vec4 uFrame; vec4 uSun; vec4 uSunColor;
+    vec4 uSkyWater; vec4 uPoolWorld; vec4 uMisc; vec4 uSelect;
+    vec4 uExposure;
+    vec4 uTemporal;
+    vec4 uPrevPos; vec4 uPrevRight; vec4 uPrevUp; vec4 uPrevFwd;
+    vec4 uBake;      // x=发光体素数
+} P;
+
+layout(set = 0, binding = 1, std430) readonly buffer VoxelBuf { uint voxelWords[]; };
+layout(set = 0, binding = 2, std430) readonly buffer SphereBuf { vec4 sphereData[]; };
+layout(set = 0, binding = 3, std430) readonly buffer MatBuf    { vec4 matData[]; };
+layout(set = 0, binding = 5, r32ui) readonly uniform uimage2D causticsImg;
+layout(set = 0, binding = 6) uniform sampler3D giCacheSmp;
+layout(set = 0, binding = 7, rgba16f) uniform image3D giCacheImg;
+layout(set = 0, binding = 10, std430) readonly buffer EmissiveBuf { vec4 emissiveData[]; };
+
+#include "common.h.txt"
+
+void main() {
+    ivec3 c = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 ws = worldSize();
+    if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ws))) return;
+    uint m = voxelAt(c);
+    if (m == MAT_EMPTY || isMedium(m)) return;
+    if (matEmission(m).w == MTYPE_EMISSIVE) return;   // 发光体自发光不进缓存
+
+    uint seed = uint(c.x) * 1973u ^ uint(c.y) * 9277u ^ uint(c.z) * 26699u
+              ^ uint(P.uFrame.y) * 1259u;
+    pcgHash(seed); pcgHash(seed);
+
+    const vec3 dirs[6] = vec3[6](
+        vec3(1,0,0), vec3(-1,0,0), vec3(0,1,0),
+        vec3(0,-1,0), vec3(0,0,1), vec3(0,0,-1));
+
+    for (int f = 0; f < 6; f++) {
+        vec3 n = dirs[f];
+        ivec3 nb = c + ivec3(n);
+        if (any(lessThan(nb, ivec3(0))) || any(greaterThanEqual(nb, ws))) continue;
+        if (voxelAt(nb) != MAT_EMPTY) continue;        // 只烘朝空气的面
+
+        vec3 p = vec3(c) + 0.5 + n * 0.5;              // 面中心
+        // 直接光：解析 NEE（太阳+灯球+云影；水下含焦散图）——零方差
+        vec3 Edir = evalDirect(p, n, pointUnderwater(p), seed);
+        // 间接光：K 根余弦射线读缓存（跨迭代 → 辐射度收敛）
+        const int K = 6;
+        vec3 Eind = vec3(0.0);
+        for (int k = 0; k < K; k++) {
+            vec3 rdB = cosSample(n, rnd2(seed));
+            vec3 tpB = vec3(1.0);
+            vec3 pq, nq; uint mq; int sq;
+            vec3 glintB = vec3(0.0);
+            int kq = traceScene(p + n * 1e-3, rdB, tpB, seed, glintB, pq, nq, mq, sq);
+            vec3 Lo;
+            if (kq == 0) {
+                Lo = skyColor(p + n * 1e-3, rdB);
+            } else if (kq == 2 && dot(sphereData[sq * 3 + 2].rgb,
+                                      sphereData[sq * 3 + 2].rgb) > 1e-6) {
+                Lo = vec3(0.0);   // 灯光由 NEE 负责（防双重计数）
+            } else if (kq == 1 && matEmission(mq).w == MTYPE_EMISSIVE) {
+                Lo = vec3(0.0);
+            } else {
+                vec4 albq = (kq == 2) ? sphereData[sq * 3 + 1] : matAlbedo(mq);
+                Lo = albq.rgb * cacheE(pq) / PI;
+            }
+            Eind += Lo;
+        }
+        Eind *= PI / float(K);                          // 余弦采样估计量 = π·Lo
+        cacheSplat(p, Edir + Eind, 0.25);               // 烘焙快混合
+    }
+}

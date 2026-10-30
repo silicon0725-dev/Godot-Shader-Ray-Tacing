@@ -455,21 +455,7 @@ public partial class VoxelWorld : Node
             WaterY = -1000f,
         };
 
-        // 天花灯板配套的 NEE 灯球（暖白荧光；shader 端按位置哈希做坏灯闪烁）
-        var spheres = new System.Collections.Generic.List<SphereDef>();
-        var lampSpots = new (int x, int z)[]
-        {
-            (7, 7), (15, 7), (23, 7), (7, 15), (15, 15), (23, 15), (7, 23), (15, 23), (23, 23),
-        };
-        foreach (var (lx, lz) in lampSpots)
-            spheres.Add(new SphereDef
-            {
-                Pos = new Vector3(lx + 0.5f, 7.3f, lz + 0.5f),
-                Radius = 0.35f,
-                Albedo = Colors.Black,
-                Type = 0f,
-                Emission = new Color(3.2f, 3.0f, 2.5f),
-            });
-        Spheres = spheres.ToArray();
+        // 灯光全部由天花灯板（发光体素）承担——shader 端做解析 NEE 面光源
+        Spheres = System.Array.Empty<SphereDef>();
     }
 }
