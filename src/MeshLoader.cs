@@ -11,6 +11,15 @@ namespace VoxelPoolGodot;
 /// </summary>
 public static class MeshLoader
 {
+    // ---- 背景幕/棚灯过滤（与体素化器同一套规则）----
+    private static bool IsBackdrop(string name)
+    {
+        string n = name.ToLower();
+        return n.Contains("studio") || n.Contains("back") || n.Contains("drop")
+            || n.Contains("sun") || n.Contains("floor") || n.Contains("curtain")
+            || n == "none" || n.Contains("alight") || n.Contains("backdrop");
+    }
+
     // ---- OBJ 解析 ----
     public static void LoadObj(string path, float scale, Vector3 offset,
         out float[] verts, out uint[] tris, out uint[] triMats,
@@ -24,6 +33,7 @@ public static class MeshLoader
 
         uint currentMat = 0;
         string currentMatName = "default";
+        bool _skipCurrent = false;
         if (!matIdMap.ContainsKey("default")) { matIdMap["default"] = 0; matNameList.Add("default"); }
 
         foreach (var line in File.ReadLines(path))
@@ -48,8 +58,10 @@ public static class MeshLoader
                     matNameList.Add(name);
                 }
                 currentMatName = name;
+                // 过滤摄影棚/背景幕（它们的三角形会包住整个场景）
+                _skipCurrent = IsBackdrop(name);
             }
-            else if (line.StartsWith("f "))
+            else if (line.StartsWith("f ") && !_skipCurrent)
             {
                 var parts = line.Split(' ');
                 // 提取顶点索引（可能带 /vt/vn）

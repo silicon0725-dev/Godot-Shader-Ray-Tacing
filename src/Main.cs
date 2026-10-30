@@ -280,7 +280,7 @@ public partial class Main : Node
             // 加载完整 OBJ 网格车（本地路径，不入 Git）
             string objPath = @"F:\光线追踪\car_model\bugatti\bugatti.obj";
             if (System.IO.File.Exists(objPath))
-                _pt.LoadMesh(objPath, 1.8f, new Vector3(16f, 0.3f, 16f));
+                _pt.LoadMesh(objPath, 1.8f, new Vector3(16f, 1.0f, 16f));
         }
         else _world.BuildShowroom();
 
