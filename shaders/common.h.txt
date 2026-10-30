@@ -795,17 +795,18 @@ vec3 evalDirect(vec3 p, vec3 n, bool uw, inout uint seed) {
         vec3 em = emissiveData[i * 2 + 1].rgb;
         vec3 toC = c - p;
         float d = length(toC);
-        if (d < 0.9) continue;                     // 光源自身/紧邻表面跳过
+        if (d < 0.55) continue;                    // 只跳光源自身内部（0.9 会造成贴地黑圈）
         // 等效半径 0.45（≈1m² 发光面），锥采样 → 软阴影；
-        // 阴影射线停在光源体素之外（半对角 ~0.87 取 0.95 防自遮挡）
-        float sinMax = 0.45 / d;
+        // 阴影射线停在光源体素之外（半对角 ~0.87 取 0.95 防自遮挡），
+        // 近距离钳为 0 长度（贴着光 = 无遮挡全亮）
+        float sinMax = min(0.45 / d, 0.95);
         float cosMax = sqrt(max(0.0, 1.0 - sinMax * sinMax));
         vec3 wi = coneSample(toC / d, cosMax, rnd2(seed));
         float NoL = dot(n, wi);
         if (NoL <= 0.0) continue;
         float solid = 2.0 * PI * (1.0 - cosMax);
         vec3 so = p + n * 1e-3;
-        vec3 T = shadowTransmittance(so, wi, d - 0.95);
+        vec3 T = shadowTransmittance(so, wi, max(d - 0.95, 0.02));
         if (dot(T, T) < 1e-6) continue;
         float fl = lightFlicker(floor(c), lampT());
         E += em * (NoL * solid) * T * fl;
