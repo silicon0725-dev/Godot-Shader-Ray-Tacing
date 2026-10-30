@@ -29,23 +29,24 @@ void main() {
     float invSpp = 1.0 / max(P.uTemporal.z, 1.0);
     vec3 cur = imageLoad(frameImg, pix).rgb * invSpp;
 
-    // 本帧 3×3 邻域颜色盒（标准 TAA 邻域钳制，抑制镜面/遮挡重影）
+    // 本帧 3×3 邻域统计 → 方差钳制盒（比 min/max 更紧，防重影更狠）
     vec4 posHit = imageLoad(posImg, pix);
-    vec3 cMin = cur, cMax = cur;
+    vec3 nMean = vec3(0.0), nMean2 = vec3(0.0);
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             ivec2 q = clamp(pix + ivec2(dx, dy), ivec2(0),
                             ivec2(int(P.uRes.x) - 1, int(P.uRes.y) - 1));
             vec3 n = imageLoad(frameImg, q).rgb * invSpp;
-            cMin = min(cMin, n);
-            cMax = max(cMax, n);
+            nMean += n;
+            nMean2 += n * n;
         }
     }
-    // 放宽 40%（保留时域平滑，避免过锐/闪烁）
-    vec3 cMean = (cMin + cMax) * 0.5;
-    vec3 cExt = (cMax - cMin) * 0.5 * 1.4 + vec3(0.02);
-    cMin = cMean - cExt;
-    cMax = cMean + cExt;
+    nMean /= 9.0;
+    nMean2 /= 9.0;
+    vec3 nStd = sqrt(max(nMean2 - nMean * nMean, vec3(0.0)));
+    // γ=1.25 + 小偏置：平滑区域盒子紧（拒绝旧残影），噪声区域适度放宽
+    vec3 cMin = nMean - nStd * 1.25 - vec3(0.015);
+    vec3 cMax = nMean + nStd * 1.25 + vec3(0.015);
 
     // 世界坐标 → 上一帧屏幕坐标。
     // 相机基带 tan(fov)/aspect 缩放（与光线生成一致），反解必须按基长度归一：
@@ -54,7 +55,7 @@ void main() {
     float z = dot(d, P.uPrevFwd.xyz);
     float alpha = P.uTemporal.y;
     // 镜面/折射路径（posImg.w 标记）：内容随视角变化快 → 提高本帧权重防拖影
-    if (posHit.w > 0.5) alpha = max(alpha, 0.45);
+    if (posHit.w > 0.5) alpha = max(alpha, 0.55);
     vec3 outC = cur;
     if (z > 0.05 && P.uTemporal.w < 0.5) {
         float kF = dot(P.uPrevFwd.xyz, P.uPrevFwd.xyz);      // |F|²
@@ -63,6 +64,10 @@ void main() {
             dot(d, P.uPrevUp.xyz)    / z * (kF / dot(P.uPrevUp.xyz, P.uPrevUp.xyz)));
         vec2 uvN = vec2((ndc.x + 1.0) * 0.5, (1.0 - ndc.y) * 0.5);
         if (all(greaterThan(uvN, vec2(0.0))) && all(lessThan(uvN, vec2(1.0)))) {
+            // 速度感知：内容在屏幕上移动越快越要跟手（快速平移时抑制拖影）
+            vec2 curUV = (vec2(pix) + 0.5) * P.uRes.zw;
+            float speedPx = length((uvN - curUV) * P.uRes.xy);
+            alpha = clamp(alpha + speedPx * 0.05, alpha, 0.85);
             vec3 hist = texture(histSmp, uvN).rgb;
             // 历史异常（NaN/远偏亮）保护
             if (!any(isnan(hist)) && !any(isinf(hist)) &&
