@@ -11,6 +11,78 @@ namespace VoxelPoolGodot;
 /// </summary>
 public static class MeshLoader
 {
+    // ---- 均匀网格加速（32³ 格子，每格三角形列表）----
+    // 输出 gridInfo(4 float: minX minY minZ cellSize) + gridCells(32³ × 2 float: firstTri count)
+    // 三角形按格子重排（每三角形按质心分配到唯一格子）
+    public static void BuildGrid(float[] verts, uint[] tris,
+        out float[] gridInfo, out float[] gridCells, out uint[] gridTris)
+    {
+        const int G = 32;
+        int triCount = tris.Length / 4;
+
+        // 包围盒：只从三角形的顶点算（过滤后的实际范围，不含背景幕顶点）
+        float mnx = float.MaxValue, mny = float.MaxValue, mnz = float.MaxValue;
+        float mxx = float.MinValue, mxy = float.MinValue, mxz = float.MinValue;
+        for (int t = 0; t < triCount; t++)
+        {
+            for (int v = 0; v < 3; v++)
+            {
+                int vi = (int)tris[t * 4 + v];
+                mnx = Math.Min(mnx, verts[vi * 4]);
+                mny = Math.Min(mny, verts[vi * 4 + 1]);
+                mnz = Math.Min(mnz, verts[vi * 4 + 2]);
+                mxx = Math.Max(mxx, verts[vi * 4]);
+                mxy = Math.Max(mxy, verts[vi * 4 + 1]);
+                mxz = Math.Max(mxz, verts[vi * 4 + 2]);
+            }
+        }
+        float cell = Math.Max(Math.Max(mxx - mnx, mxy - mny), mxz - mnz) / G;
+        cell = Math.Max(cell, 0.01f);
+
+        // 质心 → 格子索引
+        var cellOf = new int[triCount];
+        var cellCount = new int[G * G * G];
+        for (int t = 0; t < triCount; t++)
+        {
+            int v0 = (int)tris[t * 4], v1 = (int)tris[t * 4 + 1], v2 = (int)tris[t * 4 + 2];
+            float cx = (verts[v0 * 4] + verts[v1 * 4] + verts[v2 * 4]) / 3;
+            float cy = (verts[v0 * 4 + 1] + verts[v1 * 4 + 1] + verts[v2 * 4 + 1]) / 3;
+            float cz = (verts[v0 * 4 + 2] + verts[v1 * 4 + 2] + verts[v2 * 4 + 2]) / 3;
+            int gx = Math.Clamp((int)((cx - mnx) / cell), 0, G - 1);
+            int gy = Math.Clamp((int)((cy - mny) / cell), 0, G - 1);
+            int gz = Math.Clamp((int)((cz - mnz) / cell), 0, G - 1);
+            cellOf[t] = gx + gy * G + gz * G * G;
+            cellCount[cellOf[t]]++;
+        }
+
+        // 前缀和 → 每格起始位置
+        var cellStart = new int[G * G * G + 1];
+        for (int i = 0; i < G * G * G; i++) cellStart[i + 1] = cellStart[i] + cellCount[i];
+
+        // 填充重排三角形
+        var fill = new int[G * G * G];
+        gridTris = new uint[triCount * 4];
+        for (int t = 0; t < triCount; t++)
+        {
+            int ci = cellOf[t];
+            int dst = cellStart[ci] + fill[ci]++;
+            Array.Copy(tris, t * 4, gridTris, dst * 4, 4);
+        }
+
+        // 输出
+        gridInfo = new float[] { mnx, mny, mnz, cell };
+        gridCells = new float[G * G * G * 2];
+        for (int i = 0; i < G * G * G; i++)
+        {
+            gridCells[i * 2] = cellStart[i];
+            gridCells[i * 2 + 1] = cellCount[i];
+        }
+
+        int maxCount = 0;
+        for (int i = 0; i < G * G * G; i++) maxCount = Math.Max(maxCount, cellCount[i]);
+        GD.Print($"网格: {G}³={G*G*G} 格, 最大格 {maxCount} 三角形, 平均 {triCount / (G*G*G):F0}");
+    }
+
     // ---- 背景幕/棚灯过滤（与体素化器同一套规则）----
     private static bool IsBackdrop(string name)
     {
@@ -211,10 +283,10 @@ public static class MeshLoader
 
         int leftChild = BuildBVHRecursive(verts, tris, centroids, triIndices,
             start, mid - start, nodeA, nodeB, reordered);
-        BuildBVHRecursive(verts, tris, centroids, triIndices,
+        int rightChild = BuildBVHRecursive(verts, tris, centroids, triIndices,
             mid, start + count - mid, nodeA, nodeB, reordered);
 
-        // 回填
+        // 回填：nodeA.w = 左子索引，nodeB.w = -(右子索引+1)（负数=内部节点）
         nodeA[placeholderIdx * 4 + 0] = mnx;
         nodeA[placeholderIdx * 4 + 1] = mny;
         nodeA[placeholderIdx * 4 + 2] = mnz;
@@ -222,7 +294,7 @@ public static class MeshLoader
         nodeB[placeholderIdx * 4 + 0] = mxx;
         nodeB[placeholderIdx * 4 + 1] = mxy;
         nodeB[placeholderIdx * 4 + 2] = mxz;
-        nodeB[placeholderIdx * 4 + 3] = 0; // 0 = 内部节点
+        nodeB[placeholderIdx * 4 + 3] = -(rightChild + 1); // 负数编码区分叶节点
 
         return placeholderIdx;
     }
