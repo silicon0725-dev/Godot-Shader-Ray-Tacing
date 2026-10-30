@@ -46,8 +46,76 @@ layout(set = 0, binding = 8, rgba16f) uniform image2D frameImg;
 layout(set = 0, binding = 9, rgba16f) uniform image2D posImg;
 // 发光体素列表（每项 2 个 vec4：中心 / 发光色）——灯板解析 NEE
 layout(set = 0, binding = 10, std430) readonly buffer EmissiveBuf { vec4 emissiveData[]; };
+// 三角网格（车等完整模型）：顶点/三角形/BVH/材质
+layout(set = 0, binding = 11, std430) readonly buffer MeshVertBuf { vec4 meshVerts[]; };
+layout(set = 0, binding = 12, std430) readonly buffer MeshTriBuf  { uvec4 meshTris[]; };
+layout(set = 0, binding = 13, std430) readonly buffer MeshBvhABuf { vec4 meshBvhA[]; };
+layout(set = 0, binding = 14, std430) readonly buffer MeshBvhBBuf { vec4 meshBvhB[]; };
+layout(set = 0, binding = 15, std430) readonly buffer MeshMatBuf  { vec4 meshMats[]; };
 
 #include "common.h.txt"
+
+// ---- 三角网格 BVH 求交（Möller-Trumbore + 栈式遍历）-----------------------
+bool traceMesh(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nHit, out uint matHit) {
+    if (meshTris.length() == 0u) return false;
+    int stack[48];
+    int sp = 0;
+    stack[sp++] = 0;
+    float bestT = tmax;
+    int bestTri = -1;
+    vec3 invD = 1.0 / safeDir(rd);
+    while (sp > 0) {
+        int ni = stack[--sp];
+        vec4 A = meshBvhA[ni];
+        vec4 B = meshBvhB[ni];
+        vec3 t1 = (A.xyz - ro) * invD;
+        vec3 t2 = (B.xyz - ro) * invD;
+        vec3 tmn = min(t1, t2), tmx = max(t1, t2);
+        float tEnter = max(max(tmn.x, tmn.y), tmn.z);
+        float tExit  = min(min(tmx.x, tmx.y), tmx.z);
+        if (tEnter > tExit || tExit < 0.0 || tEnter > bestT) continue;
+        if (B.w > 0.5) {
+            int first = int(A.w);
+            int cnt = int(B.w);
+            for (int i = 0; i < cnt; i++) {
+                int ti = first + i;
+                uvec4 tri = meshTris[ti];
+                vec3 v0 = meshVerts[int(tri.x)].xyz;
+                vec3 v1 = meshVerts[int(tri.y)].xyz;
+                vec3 v2 = meshVerts[int(tri.z)].xyz;
+                vec3 e1 = v1 - v0;
+                vec3 e2 = v2 - v0;
+                vec3 pv = cross(rd, e2);
+                float det = dot(e1, pv);
+                if (abs(det) < 1e-10) continue;
+                float invDet = 1.0 / det;
+                vec3 tv = ro - v0;
+                float u = dot(tv, pv) * invDet;
+                if (u < 0.0 || u > 1.0) continue;
+                vec3 qv = cross(tv, e1);
+                float v = dot(rd, qv) * invDet;
+                if (v < 0.0 || u + v > 1.0) continue;
+                float tt = dot(e2, qv) * invDet;
+                if (tt > 1e-4 && tt < bestT) { bestT = tt; bestTri = ti; }
+            }
+        } else {
+            int left = int(A.w);
+            if (sp < 46) { stack[sp++] = left; stack[sp++] = left + 1; }
+        }
+    }
+    if (bestTri >= 0) {
+        tHit = bestT;
+        uvec4 tri = meshTris[bestTri];
+        vec3 v0 = meshVerts[int(tri.x)].xyz;
+        vec3 v1 = meshVerts[int(tri.y)].xyz;
+        vec3 v2 = meshVerts[int(tri.z)].xyz;
+        nHit = normalize(cross(v1 - v0, v2 - v0));
+        if (dot(nHit, rd) > 0.0) nHit = -nHit;
+        matHit = tri.w;
+        return true;
+    }
+    return false;
+}
 
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
@@ -84,6 +152,24 @@ void main() {
         vec3 p, n; uint mVox; int si;
         vec3 glint = vec3(0.0);
         int kind = traceScene(ro, rd, throughput, seed, glint, p, n, mVox, si);
+
+        // 三角网格（车）：如果比体素/球更近则替换命中
+        {
+            float mT; vec3 mN; uint mMat;
+            if (traceMesh(ro, rd, 1e5, mT, mN, mMat)) {
+                float sceneT = (kind != 0) ? length(p - P.uCamPos.xyz) : 1e5;
+                // 用本段起点计算（折射后的 ro 可能已变）
+                float segT = (kind != 0) ? length(p - ro) : 1e5;
+                if (mT < segT) {
+                    kind = 3;
+                    p = ro + rd * mT;
+                    n = mN;
+                    mVox = mMat;
+                    si = -1;
+                }
+            }
+        }
+
         radiance += glint;
 
         if (!haveFirst) {
@@ -181,6 +267,91 @@ void main() {
             ro = p + n * 1e-3;
             throughput *= alb.rgb;
             lastSpecular = false;
+        } else if (kind == 3) {
+            // ================= 三角网格（完整模型）=========================
+            vec4 alb = meshMats[int(mVox) * 2];       // albedo + roughness
+            vec4 em  = meshMats[int(mVox) * 2 + 1];   // emission + type
+            float rough = clamp(alb.w, 0.02, 1.0);
+
+            if (em.w == 2.0) {   // 发光（车灯）
+                radiance += throughput * em.rgb;
+                break;
+            }
+            if (em.w == 1.0) {   // 金属（镀铬）
+                radiance += throughput * alb.rgb * sunSpecular(rd, n);
+                vec3 fuzz = (vec3(rnd(seed), rnd(seed), rnd(seed)) - 0.5) * rough;
+                rd = normalize(reflect(rd, n) + fuzz);
+                ro = p + n * 1e-4;
+                throughput *= alb.rgb;
+                lastSpecular = true;
+                continue;
+            }
+            if (em.w == 3.0) {   // 玻璃（车窗：单面薄折射）
+                float cosI = clamp(-dot(rd, n), 0.0, 1.0);
+                float F = 0.04 + 0.96 * pow(1.0 - cosI, 5.0);
+                if (rnd(seed) < F) {
+                    rd = reflect(rd, n); ro = p + n * 1e-4;
+                    lastSpecular = true;
+                    continue;
+                }
+                vec3 rin = refract(rd, n, 1.0 / 1.5);
+                if (dot(rin, rin) > 1e-8) {
+                    throughput *= exp(-alb.rgb * 0.12);  // 薄玻璃吸收
+                    rd = normalize(rin);
+                    ro = p + rd * 2e-3;
+                    lastSpecular = true;
+                    continue;
+                }
+                rd = reflect(rd, n); ro = p + n * 1e-4;
+                lastSpecular = true;
+                continue;
+            }
+            // ---- 漫反射 / 车漆（GGX 光泽 + NEE + GI 缓存弹射）----
+            {
+                bool uw = pointUnderwater(p);
+                vec3 Edir = evalDirect(p, n, uw, seed);
+                radiance += throughput * alb.rgb * Edir / PI;
+
+                // 电介质菲涅尔镜面瓣（车漆光泽反射）
+                float cosV = clamp(dot(n, -rd), 0.0, 1.0);
+                float F = 0.04 + 0.96 * pow(1.0 - cosV, 5.0);
+                if (P.uFrame.w > 0.5)
+                    radiance += throughput * F * exp(-(rough * rough) * 40.0) * sunSpecular(rd, n);
+                if (rough < 0.95 && rnd(seed) < F) {
+                    vec3 wh = sampleGGX(n, rough, rnd2(seed));
+                    vec3 dir = reflect(rd, wh);
+                    if (dot(dir, n) > 0.0) {
+                        rd = dir; ro = p + n * 1e-4;
+                        lastSpecular = true;
+                        if (bounce == 0) pathSpecular = true;
+                        continue;
+                    }
+                }
+                // GI 单段弹射
+                vec3 rdB = cosSample(n, rnd2(seed));
+                vec3 tpB = vec3(1.0);
+                vec3 pq, nq; uint mq; int sq;
+                vec3 glintB = vec3(0.0);
+                int kq = traceScene(p + n * 1e-3, rdB, tpB, seed, glintB, pq, nq, mq, sq);
+                vec3 Lq;
+                if (kq == 0) {
+                    Lq = skyColor(p + n * 1e-3, rdB);
+                } else if (kq == 2 && dot(sphereData[sq * 3 + 2].rgb,
+                                          sphereData[sq * 3 + 2].rgb) > 1e-6) {
+                    Lq = vec3(0.0);
+                } else if (kq == 1 && matEmission(mq).w == MTYPE_EMISSIVE) {
+                    Lq = vec3(0.0);
+                } else if (kq == 3) {
+                    vec4 albq = meshMats[int(mq) * 2];
+                    Lq = albq.rgb * cacheE(pq) / PI;
+                } else {
+                    vec4 albq = (kq == 2) ? sphereData[sq * 3 + 1] : matAlbedo(mq);
+                    Lq = albq.rgb * cacheE(pq) / PI;
+                }
+                radiance += throughput * alb.rgb * (Lq * tpB + glintB);
+                cacheSplat(p, Edir + Lq * PI, 0.05);
+                break;
+            }
         } else {
             // ================= 体素（PBR：粗糙度驱动的镜面/漫反射双瓣）=========
             vec4 alb = matAlbedo(mVox);

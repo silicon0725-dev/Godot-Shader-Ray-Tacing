@@ -504,6 +504,41 @@ public partial class VoxelWorld : Node
         }
     }
 
+    /// <summary>展厅预设（网格版）：黑亮地板 + 三色摄影灯，车由 OBJ 网格渲染</summary>
+    public void BuildShowroomMesh()
+    {
+        Array.Clear(Voxels, 0, Voxels.Length);
+        for (int x = 1; x < 31; x++)
+            for (int z = 1; z < 31; z++)
+                this[x, 0, z] = ((x - 16) * (x - 16) + (z - 16) * (z - 16) <= 14 * 14)
+                              ? MatId.PaintNavy : MatId.Stone;
+
+        Scene = new SceneDef
+        {
+            Name = "展厅 Showroom（网格车）",
+            SpawnPos = new Vector3(16f, 7.5f, 28.5f),
+            SpawnYaw = 0f,
+            SpawnPitch = -0.10f,
+            SunDir = new Vector3(0.3f, 0.7f, 0.35f).Normalized(),
+            SunIntensity = 1.2f,
+            SunColor = new Color(1f, 0.97f, 0.92f),
+            SkyIntensity = 0.35f,
+            Exposure = 1.0f,
+            SunOn = true,
+            WaterY = -1000f,
+        };
+
+        Spheres = new SphereDef[]
+        {
+            new() { Pos = new Vector3(8f, 12f, 10f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(0.4f, 3.6f, 4.4f) },
+            new() { Pos = new Vector3(24f, 13f, 10f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(4.4f, 0.5f, 3.2f) },
+            new() { Pos = new Vector3(16f, 14f, 22f), Radius = 0.5f,
+                    Albedo = Colors.Black, Type = 0f, Emission = new Color(4.6f, 4.4f, 4.0f) },
+        };
+    }
+
     /// <summary>展厅预设：黑亮地板 + 三色摄影灯 + 体素超跑</summary>
     public void BuildShowroom()
     {

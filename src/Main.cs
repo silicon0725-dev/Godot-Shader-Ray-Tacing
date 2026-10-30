@@ -274,6 +274,14 @@ public partial class Main : Node
         if (index == 0) _world.BuildPool();
         else if (index == 1) _world.BuildCornell();
         else if (index == 2) _world.BuildBackrooms();
+        else if (index == 3)
+        {
+            _world.BuildShowroomMesh();
+            // 加载完整 OBJ 网格车（本地路径，不入 Git）
+            string objPath = @"F:\光线追踪\car_model\bugatti\bugatti.obj";
+            if (System.IO.File.Exists(objPath))
+                _pt.LoadMesh(objPath, 1.8f, new Vector3(16f, 0.3f, 16f));
+        }
         else _world.BuildShowroom();
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
