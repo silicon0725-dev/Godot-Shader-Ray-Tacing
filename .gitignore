@@ -7,3 +7,6 @@ build/
 # 大资产（84MB 原始 OBJ + 43MB blend 不入库；低模/贴图/mtl 保留）
 assets/bugatti_rt/bugatti.obj
 assets/bugatti_rt/bugatti_rt.blend
+
+# Godot 自动生成的导入缓存
+*.import
