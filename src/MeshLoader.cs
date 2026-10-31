@@ -24,10 +24,12 @@ public static class MeshLoader
     public static void LoadObj(string path, float scale, Vector3 offset,
         out float[] verts, out uint[] tris, out uint[] triMats,
         out string[] matNames, out Vector3 meshMin, out Vector3 meshMax,
-        float rotYDeg = 0f)
+        out float[] uvs, float rotYDeg = 0f)
     {
         var positions = new List<float>(744000 * 3);
+        var uvList = new List<float>(1024);          // vt 坐标（每项 2 float）
         var faceList = new List<uint>(760000 * 3);
+        var faceUv = new List<int>(760000 * 3);      // 每角对应的 vt 索引（-1 = 无）
         var matList = new List<uint>(760000);
         var matNameList = new List<string>();
         var matIdMap = new Dictionary<string, uint>();
@@ -54,6 +56,15 @@ public static class MeshLoader
                     positions.Add(rz * scale + offset.Z);
                 }
             }
+            else if (line.StartsWith("vt "))
+            {
+                var parts = line.Split(' ', 3);
+                if (parts.Length >= 3)
+                {
+                    uvList.Add(float.Parse(parts[1]));
+                    uvList.Add(float.Parse(parts[2]));
+                }
+            }
             else if (line.StartsWith("usemtl"))
             {
                 var name = line.Substring(7).Trim();
@@ -70,12 +81,22 @@ public static class MeshLoader
             else if (line.StartsWith("f ") && !_skipCurrent)
             {
                 var parts = line.Split(' ');
-                // 提取顶点索引（可能带 /vt/vn）
+                // 提取顶点索引（v/vt/vn 三段，vt 供法线贴图）
                 var indices = new List<int>();
+                var uvIndices = new List<int>();
+                int uvCount = uvList.Count / 2;
                 for (int i = 1; i < parts.Length; i++)
                 {
-                    var idx = parts[i].Split('/')[0];
-                    if (int.TryParse(idx, out var v)) indices.Add(v > 0 ? v - 1 : positions.Count / 3 + v);
+                    var seg = parts[i].Split('/');
+                    int vt = -1;
+                    if (seg.Length > 1 && seg[1].Length > 0 && int.TryParse(seg[1], out var vt0))
+                        vt = vt0 > 0 ? vt0 - 1 : uvCount + vt0;
+                    // 顶点段解析失败（空段）时两个列表都跳过，保持逐角对齐
+                    if (int.TryParse(seg[0], out var v))
+                    {
+                        indices.Add(v > 0 ? v - 1 : positions.Count / 3 + v);
+                        uvIndices.Add(vt);
+                    }
                 }
                 // 三角扇
                 for (int i = 1; i + 1 < indices.Count; i++)
@@ -83,20 +104,56 @@ public static class MeshLoader
                     faceList.Add((uint)indices[0]);
                     faceList.Add((uint)indices[i]);
                     faceList.Add((uint)indices[i + 1]);
+                    faceUv.Add(uvIndices[0]);
+                    faceUv.Add(uvIndices[i]);
+                    faceUv.Add(uvIndices[i + 1]);
                     matList.Add(currentMat);
                 }
             }
         }
 
-        int vertCount = positions.Count / 3;
+        // ---- 顶点膨胀：OBJ 的 v/vt 分离索引 → (v,vt) 去重合并成带 UV 的单顶点表 ----
+        // （无 vt 的模型退化为原顶点表、UV 全 0 —— 与武士刀路径完全兼容）
+        int cornerCount = faceList.Count;
+        var posOut = new List<float>(positions.Count);
+        var uvOut = new List<float>(positions.Count / 3 * 2 + 8);
+        var remap = new Dictionary<long, int>(positions.Count / 3);
+        for (int c = 0; c < cornerCount; c++)
+        {
+            long key = ((long)faceList[c] << 32) | (uint)(faceUv[c] + 1);
+            if (!remap.TryGetValue(key, out int ni))
+            {
+                ni = posOut.Count / 3;
+                int vi = (int)faceList[c];
+                posOut.Add(positions[vi * 3 + 0]);
+                posOut.Add(positions[vi * 3 + 1]);
+                posOut.Add(positions[vi * 3 + 2]);
+                int ti = faceUv[c];
+                if (ti >= 0 && ti * 2 + 1 < uvList.Count)
+                {
+                    uvOut.Add(uvList[ti * 2 + 0]);
+                    uvOut.Add(uvList[ti * 2 + 1]);
+                }
+                else
+                {
+                    uvOut.Add(0f);
+                    uvOut.Add(0f);
+                }
+                remap[key] = ni;
+            }
+            faceList[c] = (uint)ni;
+        }
+
+        int vertCount = posOut.Count / 3;
         verts = new float[vertCount * 4]; // vec4 xyz+pad
         for (int i = 0; i < vertCount; i++)
         {
-            verts[i * 4 + 0] = positions[i * 3 + 0];
-            verts[i * 4 + 1] = positions[i * 3 + 1];
-            verts[i * 4 + 2] = positions[i * 3 + 2];
+            verts[i * 4 + 0] = posOut[i * 3 + 0];
+            verts[i * 4 + 1] = posOut[i * 3 + 1];
+            verts[i * 4 + 2] = posOut[i * 3 + 2];
             verts[i * 4 + 3] = 0;
         }
+        uvs = uvOut.ToArray();
 
         // ---- 材质级清理 ----
         // 1) 剔除"笼子"材质：包围盒尺寸远超其余材质最大值（如 17³ 的摄影棚盒，
@@ -312,11 +369,131 @@ public static class MeshLoader
         return self;
     }
 
+    // ---- BVH CPU 自检：随机射线 对比 BVH 遍历 vs 暴力求交 ----
+    // 返回 false 时打印首个不一致（定位数据/遍历 bug）
+    public static bool BvhSelfTest(float[] verts, float[] bvhNodes, uint[] bvhMeta, uint[] bvhTris,
+        int tests = 200)
+    {
+        int triCount = bvhTris.Length / 4;
+        var rng = new Random(42);
+        // 包围盒
+        float mnx = float.MaxValue, mny = float.MaxValue, mnz = float.MaxValue;
+        float mxx = float.MinValue, mxy = float.MinValue, mxz = float.MinValue;
+        for (int t = 0; t < triCount; t++)
+            for (int v = 0; v < 3; v++)
+            {
+                int vi = (int)bvhTris[t * 4 + v];
+                mnx = Math.Min(mnx, verts[vi * 4]); mny = Math.Min(mny, verts[vi * 4 + 1]);
+                mnz = Math.Min(mnz, verts[vi * 4 + 2]);
+                mxx = Math.Max(mxx, verts[vi * 4]); mxy = Math.Max(mxy, verts[vi * 4 + 1]);
+                mxz = Math.Max(mxz, verts[vi * 4 + 2]);
+            }
+        var ctr = new Vector3((mnx + mxx) / 2, (mny + mxy) / 2, (mnz + mxz) / 2);
+        float rad = Math.Max(Math.Max(mxx - mnx, mxy - mny), mxz - mnz) * 0.8f + 1f;
+
+        for (int test = 0; test < tests; test++)
+        {
+            // 随机外部点 → 随机内部点
+            var ro = ctr + new Vector3(rng.NextSingle() * 2 - 1, rng.NextSingle() * 2 - 1,
+                                       rng.NextSingle() * 2 - 1) * rad;
+            var tgt = ctr + new Vector3(rng.NextSingle() * 2 - 1, rng.NextSingle() * 2 - 1,
+                                        rng.NextSingle() * 2 - 1) * rad * 0.5f;
+            var rd = (tgt - ro).Normalized();
+
+            // 暴力最近命中
+            float brute = float.MaxValue;
+            for (int t = 0; t < triCount; t++)
+            {
+                var hit = TriHit(verts, bvhTris, t, ro, rd);
+                if (hit > 1e-4 && hit < brute) brute = hit;
+            }
+            // BVH 遍历
+            float bvh = BvhHit(verts, bvhNodes, bvhMeta, bvhTris, ro, rd);
+            bool ok = (brute == float.MaxValue && bvh == float.MaxValue)
+                   || Math.Abs(brute - bvh) < 1e-3;
+            if (!ok)
+            {
+                GD.Print($"[BVH自检失败] test={test} ro=({ro.X:F1},{ro.Y:F1},{ro.Z:F1}) " +
+                         $"rd=({rd.X:F2},{rd.Y:F2},{rd.Z:F2}) 暴力={brute:F3} BVH={bvh:F3}");
+                return false;
+            }
+        }
+        GD.Print($"[BVH自检通过] {tests} 条射线一致 (三角形 {triCount})");
+        return true;
+    }
+
+    private static float TriHit(float[] verts, uint[] tris, int t, Vector3 ro, Vector3 rd)
+    {
+        var v0 = new Vector3(verts[(int)tris[t * 4] * 4], verts[(int)tris[t * 4] * 4 + 1], verts[(int)tris[t * 4] * 4 + 2]);
+        var v1 = new Vector3(verts[(int)tris[t * 4 + 1] * 4], verts[(int)tris[t * 4 + 1] * 4 + 1], verts[(int)tris[t * 4 + 1] * 4 + 2]);
+        var v2 = new Vector3(verts[(int)tris[t * 4 + 2] * 4], verts[(int)tris[t * 4 + 2] * 4 + 1], verts[(int)tris[t * 4 + 2] * 4 + 2]);
+        var e1 = v1 - v0;
+        var e2 = v2 - v0;
+        var pv = rd.Cross(e2);
+        float det = e1.Dot(pv);
+        if (Math.Abs(det) < 1e-10) return -1;
+        float invDet = 1f / det;
+        var tv = ro - v0;
+        float u = tv.Dot(pv) * invDet;
+        if (u < 0 || u > 1) return -1;
+        var qv = tv.Cross(e1);
+        float v = rd.Dot(qv) * invDet;
+        if (v < 0 || u + v > 1) return -1;
+        return e2.Dot(qv) * invDet;
+    }
+
+    private static float BvhHit(float[] verts, float[] bvhNodes, uint[] bvhMeta, uint[] bvhTris,
+        Vector3 ro, Vector3 rd)
+    {
+        const uint NIL = 0xFFFFFFFFu;
+        float best = float.MaxValue;
+        var inv = new Vector3(
+            1f / (Math.Abs(rd.X) < 1e-10f ? 1e-10f : rd.X),
+            1f / (Math.Abs(rd.Y) < 1e-10f ? 1e-10f : rd.Y),
+            1f / (Math.Abs(rd.Z) < 1e-10f ? 1e-10f : rd.Z));
+        var stack = new int[64];
+        int sp = 0;
+        stack[sp++] = 0;
+        while (sp > 0)
+        {
+            int n = stack[--sp];
+            uint l = bvhMeta[n * 4], r = bvhMeta[n * 4 + 1];
+            uint first = bvhMeta[n * 4 + 2], cnt = bvhMeta[n * 4 + 3];
+            var mn = new Vector3(bvhNodes[n * 8], bvhNodes[n * 8 + 1], bvhNodes[n * 8 + 2]);
+            var mx = new Vector3(bvhNodes[n * 8 + 4], bvhNodes[n * 8 + 5], bvhNodes[n * 8 + 6]);
+            // AABB slab
+            float t1 = (mn.X - ro.X) * inv.X, t2 = (mx.X - ro.X) * inv.X;
+            float tN = Math.Min(t1, t2), tF = Math.Max(t1, t2);
+            t1 = (mn.Y - ro.Y) * inv.Y; t2 = (mx.Y - ro.Y) * inv.Y;
+            tN = Math.Max(tN, Math.Min(t1, t2)); tF = Math.Min(tF, Math.Max(t1, t2));
+            t1 = (mn.Z - ro.Z) * inv.Z; t2 = (mx.Z - ro.Z) * inv.Z;
+            tN = Math.Max(tN, Math.Min(t1, t2)); tF = Math.Min(tF, Math.Max(t1, t2));
+            if (tN > tF || tF < 0 || tN > best) continue;
+            if (cnt > 0)
+            {
+                for (uint ti = first; ti < first + cnt; ti++)
+                {
+                    float h = TriHit(verts, bvhTris, (int)ti, ro, rd);
+                    if (h > 1e-4 && h < best) best = h;
+                }
+            }
+            else
+            {
+                if (r != NIL && sp < 64) stack[sp++] = (int)r;
+                if (l != NIL && sp < 64) stack[sp++] = (int)l;
+            }
+        }
+        return best;
+    }
+
     // ---- OBJ 材质名 → 引擎材质映射 ----
     // 返回 float[]: 每材质 8 个 float (albedo.xyz+rough, emission.xyz+type)
-    // type: 0=漫反射 1=金属 2=发光 3=玻璃
-    public static float[] BuildMeshMaterials(string[] matNames, string mtlPath = null)
+    // type: 0=漫反射 1=金属 2=发光 3=玻璃 4=金属+法线贴图 5=车漆/漫反射+法线贴图
+    public static float[] BuildMeshMaterials(string[] matNames, string mtlPath = null,
+        bool normalMap = false)
     {
+        float tMetal = normalMap ? 4f : 1f;
+        float tPaint = normalMap ? 5f : 0f;
         // 解析 MTL 文件获取 Kd 颜色
         var mtlKd = new Dictionary<string, float[]>();
         if (mtlPath != null && File.Exists(mtlPath))
@@ -365,23 +542,23 @@ public static class MeshLoader
                   || n.Contains("nut") || n.Contains("mirror")
                   || n.Contains("刀头") || n.Contains("环") || n.Contains("blade")
                   || (kd[0] > 0.8f && kd[1] > 0.6f && kd[2] < 0.1f))  // 金色 Kd → 金属
-                Set(i, kd[0], kd[1], kd[2], 0.08f, 0, 0, 0, 1);
+                Set(i, kd[0], kd[1], kd[2], 0.08f, 0, 0, 0, tMetal);
             // 轮胎/黑色粗糙
             else if (n.Contains("tire") || n.Contains("tyre") || n.Contains("rubber")
                   || n.Contains("wheel") || n.Contains("rim"))
-                Set(i, 0.07f, 0.07f, 0.08f, 0.95f, 0, 0, 0, 0);
+                Set(i, 0.07f, 0.07f, 0.08f, 0.95f, 0, 0, 0, tPaint);
             // 车漆/光泽表面（含中文材质.005/.006/.007 → 用 Kd 颜色）
             else if (n.Contains("navy") || n.Contains("body") || n.Contains("paint") || n.Contains("blue"))
             {
-                if (n.Contains("navy")) Set(i, 0.04f, 0.05f, 0.10f, 0.18f, 0, 0, 0, 0);
-                else Set(i, 0.05f, 0.10f, 0.70f, 0.18f, 0, 0, 0, 0);
+                if (n.Contains("navy")) Set(i, 0.04f, 0.05f, 0.10f, 0.18f, 0, 0, 0, tPaint);
+                else Set(i, 0.05f, 0.10f, 0.70f, 0.18f, 0, 0, 0, tPaint);
             }
             // 默认：用 MTL 的 Kd 颜色，中等粗糙度
             else if (Math.Max(kd[0], Math.Max(kd[1], kd[2])) < 0.06f)
                 // 纯黑 Kd + 高光泽（如刀身/镡的 Ns 600-1000）→ 暗钢金属（有反光而非死黑）
-                Set(i, 0.24f, 0.25f, 0.27f, 0.18f, 0, 0, 0, 1);
+                Set(i, 0.24f, 0.25f, 0.27f, 0.18f, 0, 0, 0, tMetal);
             else
-                Set(i, kd[0], kd[1], kd[2], 0.6f, 0, 0, 0, 0);
+                Set(i, kd[0], kd[1], kd[2], 0.6f, 0, 0, 0, tPaint);
         }
         return mats;
     }

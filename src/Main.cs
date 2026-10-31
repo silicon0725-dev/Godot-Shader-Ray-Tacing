@@ -96,7 +96,7 @@ public partial class Main : Node
             "点击画面捕获鼠标 | ESC 释放\n" +
             "WASD 移动 / Space 上升 / Ctrl 下降 / Shift 加速\n" +
             "左键 删除方块 | 右键 放置方块 | T 切换材质\n" +
-            "1 泳池 | 2 康奈尔盒 | 3 后室 | 4 体素展厅 | R 重置 | M 动画\n" +
+            "1 泳池 | 2 康奈尔盒 | 3 后室 | 4 武士刀 | 5 布加迪 | R 重置 | M 动画\n" +
             "F5 保存 | F9 读取 | E 自动曝光 | PageUp/Down 渲染比例\n" +
             "[ ] 太阳高度 | - = 太阳方位（黄昏/夜晚有星空）";
 
@@ -131,6 +131,10 @@ public partial class Main : Node
             LoadPreset(2);
         else if (System.Environment.GetEnvironmentVariable("VOXELPRESET") == "3")
             LoadPreset(3);
+        else if (System.Environment.GetEnvironmentVariable("VOXELPRESET") == "4")
+            LoadPreset(4);
+        // 预设加载会重置出生机位 → 相机覆盖必须在其后
+        ApplyCameraOverride();
         if (System.Environment.GetEnvironmentVariable("VOXELGI") == "0")
             _giCache = false;
         if (float.TryParse(System.Environment.GetEnvironmentVariable("VOXELSUNELEV"),
@@ -278,24 +282,20 @@ public partial class Main : Node
         else if (index == 3)
         {
             _world.BuildShowroomMesh();
-            string[] candidates = {
-                @"F:\光线追踪\katana_model\katana.obj",
-                @"F:\光线追踪\car_model\bugatti\bugatti.obj",
-            };
-            string objPath = candidates.FirstOrDefault(p => System.IO.File.Exists(p));
-            if (objPath != null)
-            {
-                // 绕 Y 转 90°：刀架长轴从 Z 转到 X，正对默认相机（否则只能看到刀的端面）
-                const float rotY = 90f;
-                MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
-                    out _, out _, out _, out _, out var mn, out var mx, rotY);
-                var size = mx - mn;
-                float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
-                float scale = 20f / Mathf.Max(longest, 0.01f);
-                var center = (mn + mx) * 0.5f * scale;
-                var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
-                _pt.LoadMesh(objPath, scale, offset, rotY);
-            }
+            LoadMeshPreset(@"F:\光线追踪\katana_model\katana.obj", rotYDeg: 90f);
+        }
+        else if (index == 4)
+        {
+            // 布加迪：全量 147 万三角形（BVH 对数遍历，iGPU 12fps 可承受）。
+            // Blender decimate 低模在 GPU 上碎裂（CPU 自检一致却渲染错乱，未解），
+            // 法线贴图管线保留：VOXELLOWBUG=1 切回低模实验路线
+            _world.BuildShowroomMesh();
+            var assetDir = @"F:\光线追踪\VoxelPoolGodot\assets\bugatti_rt";
+            bool low = System.Environment.GetEnvironmentVariable("VOXELLOWBUG") == "1";
+            string obj = low ? System.IO.Path.Combine(assetDir, "bugatti_low.obj")
+                             : System.IO.Path.Combine(assetDir, "bugatti.obj");
+            LoadMeshPreset(obj, rotYDeg: 90f,
+                normalMapPath: low ? System.IO.Path.Combine(assetDir, "bugatti_normal.png") : null);
         }
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
@@ -306,6 +306,25 @@ public partial class Main : Node
         _sunElev = Mathf.Asin(Mathf.Clamp(sd.Y, -1f, 1f));
         _sunAzim = Mathf.Atan2(sd.X, sd.Z);
         _sampleIdx = 0;
+    }
+
+    /// <summary>加载网格模型预设：自动缩放到 20 单位、落地居中 (16,·,16)</summary>
+    private void LoadMeshPreset(string objPath, float rotYDeg = 0f, string normalMapPath = null)
+    {
+        if (!System.IO.File.Exists(objPath))
+        {
+            ShowStatus($"找不到模型: {objPath}");
+            return;
+        }
+        // 第一遍只为包围盒（第二遍在 PathTracer.LoadMesh 内）
+        MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
+            out _, out _, out _, out _, out var mn, out var mx, out _, rotYDeg);
+        var size = mx - mn;
+        float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
+        float scale = 20f / Mathf.Max(longest, 0.01f);
+        var center = (mn + mx) * 0.5f * scale;
+        var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
+        _pt.LoadMesh(objPath, scale, offset, rotYDeg, normalMapPath);
     }
 
     /// <summary>按高度/方位角更新太阳方向（重置累积与焦散）</summary>
@@ -497,6 +516,7 @@ public partial class Main : Node
                 case Key.Key2: LoadPreset(1); break;
                 case Key.Key3: LoadPreset(2); break;
                 case Key.Key4: LoadPreset(3); break;
+                case Key.Key5: LoadPreset(4); break;
                 case Key.R:
                     _cam.SetSpawn(_world.Scene.SpawnPos, _world.Scene.SpawnYaw, _world.Scene.SpawnPitch);
                     _sampleIdx = 0;

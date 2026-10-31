@@ -210,7 +210,7 @@ void main() {
                 radiance += throughput * em.rgb;
                 break;
             }
-            if (em.w == 1.0) {   // 金属（镀铬）
+            if (em.w == 1.0 || em.w == 4.0) {   // 金属（镀铬；4 = 金属+法线贴图）
                 radiance += throughput * alb.rgb * sunSpecular(rd, n);
                 vec3 fuzz = (vec3(rnd(seed), rnd(seed), rnd(seed)) - 0.5) * rough;
                 rd = normalize(reflect(rd, n) + fuzz);

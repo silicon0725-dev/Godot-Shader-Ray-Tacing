@@ -23,8 +23,9 @@ public partial class PathTracer : IDisposable
     private Rid _lumBuf, _exposureBuf;            // 自动曝光
     private Rid _emissiveBuf;                     // 发光体素列表（解析 NEE 面光源）
     private uint _emissiveCount = 0;
-    // 三角网格（BVH 版）
+    // 三角网格（BVH 版 + 法线贴图）
     private Rid _meshVertBuf, _meshTriBuf, _meshBvhABuf, _meshBvhBBuf, _meshMatBuf;
+    private Rid _meshUVBuf, _meshNormalTex, _meshNormalSampler;
     private bool _hasMesh = false;
     private Rid _frameTex, _posTex;               // 时间重投影：本帧样本/主命中位置
     private Rid _histA, _histB;                   // 历史双缓冲（ping-pong）
@@ -105,11 +106,23 @@ public partial class PathTracer : IDisposable
         });
         RecreateGiCache();
 
+        // ---- 网格法线贴图采样器（重复寻址：UV 岛平铺）----
+        _meshNormalSampler = _rd.SamplerCreate(new RDSamplerState
+        {
+            MinFilter = RenderingDevice.SamplerFilter.Linear,
+            MagFilter = RenderingDevice.SamplerFilter.Linear,
+            MipFilter = RenderingDevice.SamplerFilter.Nearest,
+            RepeatU = RenderingDevice.SamplerRepeatMode.Repeat,
+            RepeatV = RenderingDevice.SamplerRepeatMode.Repeat,
+        });
+
         // ---- 占位存储缓冲（Resize 构建绑定时需要有效的 Rid）----
         _voxelBuf = MakeStorageBuffer(new byte[4]);
         _sphereBuf = MakeStorageBuffer(new byte[16]);
         _matBuf = MakeStorageBuffer(new byte[16]);
         _emissiveBuf = MakeStorageBuffer(new byte[16]);
+        _meshUVBuf = MakeStorageBuffer(new byte[16]);
+        _meshNormalTex = LoadNormalMap(null);   // 1×1 平坦蓝图占位
 
         // ---- 清零 set ----
         _clearSet = MakeSet(_clearShader, 0, new[] {
@@ -254,23 +267,28 @@ public partial class PathTracer : IDisposable
     public uint EmissiveCount => _emissiveCount;
     public bool HasMesh => _hasMesh;
 
-    /// <summary>加载 OBJ 三角网格（顶点/BVH/材质）上传 GPU</summary>
-    public void LoadMesh(string objPath, float scale, Vector3 offset, float rotYDeg = 0f)
+    /// <summary>加载 OBJ 三角网格（顶点/BVH/材质/法线贴图）上传 GPU</summary>
+    public void LoadMesh(string objPath, float scale, Vector3 offset, float rotYDeg = 0f,
+        string normalMapPath = null)
     {
         MeshLoader.LoadObj(objPath, scale, offset,
             out var verts, out var tris, out _, out var matNames, out var meshMin, out var meshMax,
-            rotYDeg);
+            out var uvs, rotYDeg);
         // BVH（uint 索引版）：全量三角形无抽稀，每射线仅 ~40 次 AABB 测试
         MeshLoader.BuildBVH(verts, tris, out var bvhNodes, out var bvhMeta, out var bvhTris);
+        MeshLoader.BvhSelfTest(verts, bvhNodes, bvhMeta, bvhTris);
         // MTL 路径 = OBJ 同名 .mtl
         var mtlPath = System.IO.Path.ChangeExtension(objPath, ".mtl");
-        var meshMats = MeshLoader.BuildMeshMaterials(matNames, mtlPath);
+        bool hasNMap = normalMapPath != null && System.IO.File.Exists(normalMapPath);
+        var meshMats = MeshLoader.BuildMeshMaterials(matNames, mtlPath, hasNMap);
 
         if (_meshVertBuf.IsValid) _rd.FreeRid(_meshVertBuf);
         if (_meshBvhABuf.IsValid) _rd.FreeRid(_meshBvhABuf);
         if (_meshBvhBBuf.IsValid) _rd.FreeRid(_meshBvhBBuf);
         if (_meshTriBuf.IsValid) _rd.FreeRid(_meshTriBuf);
         if (_meshMatBuf.IsValid) _rd.FreeRid(_meshMatBuf);
+        if (_meshUVBuf.IsValid) _rd.FreeRid(_meshUVBuf);
+        if (_meshNormalTex.IsValid) _rd.FreeRid(_meshNormalTex);
 
         _meshVertBuf = MakeStorageBuffer(FloatsToBytes(verts));
         // BVH 节点 AABB（float）+ 元数据/三角形（uint）
@@ -282,11 +300,42 @@ public partial class PathTracer : IDisposable
         System.Buffer.BlockCopy(bvhTris, 0, triBytes, 0, triBytes.Length);
         _meshTriBuf = MakeStorageBuffer(triBytes);
         _meshMatBuf = MakeStorageBuffer(FloatsToBytes(meshMats));
+        _meshUVBuf = MakeStorageBuffer(FloatsToBytes(uvs));
+        _meshNormalTex = LoadNormalMap(hasNMap ? normalMapPath : null);
 
         _hasMesh = true;
         RebuildSets();   // pathSet 需要新绑定
-        GD.Print($"网格模型已加载: {verts.Length / 4} 顶点, {bvhTris.Length / 4} 三角形 (BVH)");
+        GD.Print($"网格模型已加载: {verts.Length / 4} 顶点, {bvhTris.Length / 4} 三角形 (BVH)" +
+                 (hasNMap ? $", 法线贴图 {System.IO.Path.GetFileName(normalMapPath)}" : ""));
         GD.Print($"  世界包围盒: ({meshMin.X:F1},{meshMin.Y:F1},{meshMin.Z:F1}) → ({meshMax.X:F1},{meshMax.Y:F1},{meshMax.Z:F1})");
+    }
+
+    /// <summary>法线贴图上传（无贴图时 1×1 平坦蓝图占位，保证绑定有效）</summary>
+    private Rid LoadNormalMap(string pngPath)
+    {
+        int w = 1, h = 1;
+        byte[] px = { 128, 128, 255, 255 };
+        if (pngPath != null)
+        {
+            var img = Image.LoadFromFile(pngPath);
+            if (img != null)
+            {
+                img.Convert(Image.Format.Rgba8);
+                w = img.GetWidth(); h = img.GetHeight();
+                px = img.GetData();
+            }
+        }
+        var f = new RDTextureFormat
+        {
+            Width = (uint)w, Height = (uint)h, Depth = 1, ArrayLayers = 1, Mipmaps = 1,
+            TextureType = RenderingDevice.TextureType.Type2D,
+            Format = RenderingDevice.DataFormat.R8G8B8A8Unorm,
+            Samples = RenderingDevice.TextureSamples.Samples1,
+            UsageBits = RenderingDevice.TextureUsageBits.SamplingBit,
+            IsResolveBuffer = false,
+        };
+        var data = new Godot.Collections.Array<byte[]> { px };
+        return _rd.TextureCreate(f, new RDTextureView(), data);
     }
 
     /// <summary>预制光照：排定 N 轮烘焙迭代（每帧最多跑 4 轮）</summary>
@@ -301,6 +350,14 @@ public partial class PathTracer : IDisposable
         RebuildSets();
         ClearCaustics();
         StartBake(32);   // 编辑后重烘
+    }
+
+    private RDUniform MeshNormalUniform(int binding)
+    {
+        var u = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = binding };
+        u.AddId(_meshNormalSampler);
+        u.AddId(_meshNormalTex);
+        return u;
     }
 
     private void RebuildSets()
@@ -323,6 +380,7 @@ public partial class PathTracer : IDisposable
             U(RenderingDevice.UniformType.StorageBuffer, 10, _emissiveBuf),
             // 三角网格（BVH）：占位缓冲保证绑定有效，LoadMesh 后替换
             // 11=顶点 12=节点AABB(float) 13=节点元数据(uint) 14=重排三角形(uint) 15=材质
+            // 16=顶点UV 17=法线贴图
             U(RenderingDevice.UniformType.StorageBuffer, 11,
               _meshVertBuf.IsValid ? _meshVertBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 12,
@@ -333,6 +391,9 @@ public partial class PathTracer : IDisposable
               _meshTriBuf.IsValid ? _meshTriBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 15,
               _meshMatBuf.IsValid ? _meshMatBuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 16,
+              _meshUVBuf.IsValid ? _meshUVBuf : MakeStorageBuffer(new byte[16])),
+            MeshNormalUniform(17),
         });
         // 焦散：UBO + 体素 + 焦散图(读写)
         _causticsSet = MakeSet(_causticsShader, 0, new[] {
@@ -386,6 +447,9 @@ public partial class PathTracer : IDisposable
               _meshTriBuf.IsValid ? _meshTriBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 15,
               _meshMatBuf.IsValid ? _meshMatBuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 16,
+              _meshUVBuf.IsValid ? _meshUVBuf : MakeStorageBuffer(new byte[16])),
+            MeshNormalUniform(17),
         });
 
         // 时间重投影（两个方向的 ping-pong set 各建一份，运行时切换）
