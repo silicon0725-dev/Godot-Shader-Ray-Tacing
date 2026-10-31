@@ -11,101 +11,6 @@ namespace VoxelPoolGodot;
 /// </summary>
 public static class MeshLoader
 {
-    // ---- 均匀网格加速（32³ 格子，每格三角形列表）----
-    // 输出 gridInfo(4 float: minX minY minZ cellSize) + gridCells(32³ × 2 float: firstTri count)
-    // 三角形按格子重排（每三角形按质心分配到唯一格子）
-    public static void BuildGrid(float[] verts, uint[] tris,
-        out float[] gridInfo, out float[] gridCells, out uint[] gridTris)
-    {
-        const int G = 16;   // 粗网格（每射线只穿 ~16 格，大幅减少总工作量）
-        const int MAX_PER_CELL = 500;  // 单格上限（500×16格=8000次求交/像素，iGPU 可承受）
-        int triCount = tris.Length / 4;
-
-        // 包围盒：只从三角形的顶点算（过滤后的实际范围，不含背景幕顶点）
-        float mnx = float.MaxValue, mny = float.MaxValue, mnz = float.MaxValue;
-        float mxx = float.MinValue, mxy = float.MinValue, mxz = float.MinValue;
-        for (int t = 0; t < triCount; t++)
-        {
-            for (int v = 0; v < 3; v++)
-            {
-                int vi = (int)tris[t * 4 + v];
-                mnx = Math.Min(mnx, verts[vi * 4]);
-                mny = Math.Min(mny, verts[vi * 4 + 1]);
-                mnz = Math.Min(mnz, verts[vi * 4 + 2]);
-                mxx = Math.Max(mxx, verts[vi * 4]);
-                mxy = Math.Max(mxy, verts[vi * 4 + 1]);
-                mxz = Math.Max(mxz, verts[vi * 4 + 2]);
-            }
-        }
-        float cell = Math.Max(Math.Max(mxx - mnx, mxy - mny), mxz - mnz) / G;
-        cell = Math.Max(cell, 0.01f);
-
-        // 空间分裂：三角形插入其 AABB 覆盖的所有格子（薄物体不再挤一格）
-        var entries = new List<(int cell, int tri)>(triCount * 2);
-        var cellCount = new int[G * G * G];
-        for (int t = 0; t < triCount; t++)
-        {
-            int v0 = (int)tris[t * 4], v1 = (int)tris[t * 4 + 1], v2 = (int)tris[t * 4 + 2];
-            // 三角形 AABB
-            float tmnx = Math.Min(verts[v0*4], Math.Min(verts[v1*4], verts[v2*4]));
-            float tmny = Math.Min(verts[v0*4+1], Math.Min(verts[v1*4+1], verts[v2*4+1]));
-            float tmnz = Math.Min(verts[v0*4+2], Math.Min(verts[v1*4+2], verts[v2*4+2]));
-            float tmxx = Math.Max(verts[v0*4], Math.Max(verts[v1*4], verts[v2*4]));
-            float tmxy = Math.Max(verts[v0*4+1], Math.Max(verts[v1*4+1], verts[v2*4+1]));
-            float tmxz = Math.Max(verts[v0*4+2], Math.Max(verts[v1*4+2], verts[v2*4+2]));
-            int x0 = Math.Clamp((int)((tmnx - mnx) / cell), 0, G - 1);
-            int y0 = Math.Clamp((int)((tmny - mny) / cell), 0, G - 1);
-            int z0 = Math.Clamp((int)((tmnz - mnz) / cell), 0, G - 1);
-            int x1 = Math.Clamp((int)((tmxx - mnx) / cell), 0, G - 1);
-            int y1 = Math.Clamp((int)((tmxy - mny) / cell), 0, G - 1);
-            int z1 = Math.Clamp((int)((tmxz - mnz) / cell), 0, G - 1);
-            for (int gz = z0; gz <= z1; gz++)
-                for (int gy = y0; gy <= y1; gy++)
-                    for (int gx = x0; gx <= x1; gx++)
-                    {
-                        int ci = gx + gy * G + gz * G * G;
-                        entries.Add((ci, t));
-                        cellCount[ci]++;
-                    }
-        }
-        // 截断
-        for (int i = 0; i < G * G * G; i++)
-            cellCount[i] = Math.Min(cellCount[i], MAX_PER_CELL);
-
-        // 截断过密格子（防 GPU 超时）
-        for (int i = 0; i < G * G * G; i++)
-            cellCount[i] = Math.Min(cellCount[i], MAX_PER_CELL);
-
-        // 前缀和 → 每格起始位置
-        var cellStart = new int[G * G * G + 1];
-        for (int i = 0; i < G * G * G; i++) cellStart[i + 1] = cellStart[i] + cellCount[i];
-
-        // 填充重排三角形（空间分裂条目按格子排序后填充，截断超额）
-        entries.Sort((a, b) => a.cell.CompareTo(b.cell));
-        int totalKept = cellStart[G * G * G];
-        var fill = new int[G * G * G];
-        gridTris = new uint[totalKept * 4];
-        foreach (var (ci, t) in entries)
-        {
-            if (fill[ci] >= cellCount[ci]) continue;  // 截断
-            int dst = cellStart[ci] + fill[ci]++;
-            Array.Copy(tris, t * 4, gridTris, dst * 4, 4);
-        }
-
-        // 输出
-        gridInfo = new float[] { mnx, mny, mnz, cell };
-        gridCells = new float[G * G * G * 2];
-        for (int i = 0; i < G * G * G; i++)
-        {
-            gridCells[i * 2] = cellStart[i];
-            gridCells[i * 2 + 1] = cellCount[i];
-        }
-
-        int maxCount = 0;
-        for (int i = 0; i < G * G * G; i++) maxCount = Math.Max(maxCount, cellCount[i]);
-        GD.Print($"网格: {G}³={G*G*G} 格, 最大格 {maxCount} 三角形, 平均 {triCount / (G*G*G):F0}");
-    }
-
     // ---- 背景幕/棚灯过滤（与体素化器同一套规则）----
     private static bool IsBackdrop(string name)
     {
@@ -118,13 +23,15 @@ public static class MeshLoader
     // ---- OBJ 解析 ----
     public static void LoadObj(string path, float scale, Vector3 offset,
         out float[] verts, out uint[] tris, out uint[] triMats,
-        out string[] matNames, out Vector3 meshMin, out Vector3 meshMax)
+        out string[] matNames, out Vector3 meshMin, out Vector3 meshMax,
+        float rotYDeg = 0f)
     {
         var positions = new List<float>(744000 * 3);
         var faceList = new List<uint>(760000 * 3);
         var matList = new List<uint>(760000);
         var matNameList = new List<string>();
         var matIdMap = new Dictionary<string, uint>();
+        float rc = (float)Math.Cos(rotYDeg * Math.PI / 180.0), rs = (float)Math.Sin(rotYDeg * Math.PI / 180.0);
 
         uint currentMat = 0;
         string currentMatName = "default";
@@ -138,9 +45,13 @@ public static class MeshLoader
                 var parts = line.Split(' ', 4);
                 if (parts.Length >= 4)
                 {
-                    positions.Add(float.Parse(parts[1]) * scale + offset.X);
-                    positions.Add(float.Parse(parts[2]) * scale + offset.Y);
-                    positions.Add(float.Parse(parts[3]) * scale + offset.Z);
+                    float x = float.Parse(parts[1]), y = float.Parse(parts[2]), z = float.Parse(parts[3]);
+                    // 先绕 Y 轴旋转（在原点），再缩放平移
+                    float rx = x * rc + z * rs;
+                    float rz = -x * rs + z * rc;
+                    positions.Add(rx * scale + offset.X);
+                    positions.Add(y * scale + offset.Y);
+                    positions.Add(rz * scale + offset.Z);
                 }
             }
             else if (line.StartsWith("usemtl"))
@@ -186,6 +97,75 @@ public static class MeshLoader
             verts[i * 4 + 2] = positions[i * 3 + 2];
             verts[i * 4 + 3] = 0;
         }
+
+        // ---- 材质级清理 ----
+        // 1) 剔除"笼子"材质：包围盒尺寸远超其余材质最大值（如 17³ 的摄影棚盒，
+        //    12 个三角形却撑大整个网格包围盒，让刀挤进一个格子）
+        int nMat = matNameList.Count;
+        var matMin = new Vector3[nMat];
+        var matMax = new Vector3[nMat];
+        for (int m = 0; m < nMat; m++)
+        {
+            matMin[m] = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            matMax[m] = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+        }
+        for (int i = 0; i < matList.Count; i++)
+        {
+            int m = (int)matList[i];
+            for (int v = 0; v < 3; v++)
+            {
+                int vi = (int)faceList[i * 3 + v];
+                matMin[m].X = Math.Min(matMin[m].X, verts[vi * 4]);
+                matMin[m].Y = Math.Min(matMin[m].Y, verts[vi * 4 + 1]);
+                matMin[m].Z = Math.Min(matMin[m].Z, verts[vi * 4 + 2]);
+                matMax[m].X = Math.Max(matMax[m].X, verts[vi * 4]);
+                matMax[m].Y = Math.Max(matMax[m].Y, verts[vi * 4 + 1]);
+                matMax[m].Z = Math.Max(matMax[m].Z, verts[vi * 4 + 2]);
+            }
+        }
+        float[] matDim = new float[nMat];
+        for (int m = 0; m < nMat; m++)
+        {
+            if (matMin[m].X == float.MaxValue) { matDim[m] = 0; continue; }
+            var s = matMax[m] - matMin[m];
+            matDim[m] = Math.Max(Math.Max(s.X, s.Y), s.Z);
+        }
+        // 逐个剔除：只要某材质尺寸 > 其余材质最大尺寸的 3 倍就算笼子
+        int[] matTriCount = new int[nMat];
+        foreach (var mc in matList) matTriCount[mc]++;
+        bool[] isCage = new bool[nMat];
+        for (int m = 0; m < nMat; m++)
+        {
+            if (matDim[m] <= 0) continue;
+            float restMax = 0;
+            for (int o = 0; o < nMat; o++)
+                if (o != m && !isCage[o]) restMax = Math.Max(restMax, matDim[o]);
+            if (restMax > 0 && matDim[m] > restMax * 3f)
+            {
+                isCage[m] = true;
+                GD.Print($"剔除笼子材质: {matNameList[m]} (尺寸 {matDim[m]:F1} >> 其余最大 {restMax:F1}, {matTriCount[m]} 三角形)");
+            }
+        }
+
+        // 2) 剔除笼子材质的三角形（BVH 能吃下全量，无需抽稀）
+        bool anyCage = false;
+        for (int m = 0; m < nMat; m++) anyCage |= isCage[m];
+        if (anyCage)
+        {
+            var keepFace = new List<uint>(faceList.Count);
+            var keepMat = new List<uint>(matList.Count);
+            for (int i = 0; i < matList.Count; i++)
+            {
+                if (isCage[matList[i]]) continue;
+                keepFace.Add(faceList[i * 3]);
+                keepFace.Add(faceList[i * 3 + 1]);
+                keepFace.Add(faceList[i * 3 + 2]);
+                keepMat.Add(matList[i]);
+            }
+            faceList = keepFace;
+            matList = keepMat;
+        }
+
         int triCount = matList.Count;
         tris = new uint[triCount * 4]; // uvec4: 3 vertex indices + material ID
         for (int i = 0; i < triCount; i++)
@@ -216,51 +196,67 @@ public static class MeshLoader
         GD.Print($"OBJ 加载: {vertCount} 顶点, {triCount} 三角形, {matNames.Length} 材质");
     }
 
-    // ---- BVH 构建（中位数分割）----
-    // 输出扁平节点数组 + 重排后的三角形索引
-    // 节点: nodeA = vec4(minX, minY, minZ, leftChildOrFirstTri)
-    //       nodeB = vec4(maxX, maxY, maxZ, triCount)  (0=内部节点, >0=叶节点)
+    // ---- BVH 构建（uint 索引版，杜绝旧 float 编码 bug）----------------------
+    // 布局：bvhNodes[2i].xyz=min / bvhNodes[2i+1].xyz=max（float）
+    //       bvhMeta[i] = (left, right, firstTri, triCount)；left=0xFFFFFFFF=空
+    // 叶子 ≤8 三角形；中位数分割保证树平衡（深度 ~log2(n/8)）
     public static void BuildBVH(float[] verts, uint[] tris,
-        out float[] nodeA, out float[] nodeB, out uint[] reorderedTris)
+        out float[] bvhNodes, out uint[] bvhMeta, out uint[] reorderedTris)
     {
+        const uint NIL = 0xFFFFFFFFu;
+        const int LEAF_SIZE = 8;
         int triCount = tris.Length / 4;
+
+        var nodes = new List<float>(triCount * 4);       // 每节点 2 个 vec4
+        var meta = new List<uint>(triCount * 4);          // 每节点 1 个 uvec4
+        var reordered = new List<uint>(Math.Max(triCount, 1) * 4);
+
+        if (triCount == 0)
+        {
+            // 空网格：单个退化根节点（AABB 永不命中）
+            bvhNodes = new float[] { 1e9f, 1e9f, 1e9f, 0, -1e9f, -1e9f, -1e9f, 0 };
+            bvhMeta = new uint[] { NIL, NIL, 0u, 0u };
+            reorderedTris = new uint[4];
+            return;
+        }
+
         var centroids = new float[triCount * 3];
-        var triIndices = new int[triCount];
+        var triIdx = new int[triCount];
         for (int i = 0; i < triCount; i++)
         {
-            triIndices[i] = i;
+            triIdx[i] = i;
             int v0 = (int)tris[i * 4], v1 = (int)tris[i * 4 + 1], v2 = (int)tris[i * 4 + 2];
             centroids[i * 3] = (verts[v0 * 4] + verts[v1 * 4] + verts[v2 * 4]) / 3;
             centroids[i * 3 + 1] = (verts[v0 * 4 + 1] + verts[v1 * 4 + 1] + verts[v2 * 4 + 1]) / 3;
             centroids[i * 3 + 2] = (verts[v0 * 4 + 2] + verts[v1 * 4 + 2] + verts[v2 * 4 + 2]) / 3;
         }
 
-        var nodeListA = new List<float>(triCount * 2);
-        var nodeListB = new List<float>(triCount * 2);
-        var reordered = new List<uint>(triCount * 4);
+        int nodeCount = BuildBVHRec(verts, tris, centroids, triIdx, 0, triCount,
+            nodes, meta, reordered, LEAF_SIZE);
+        _ = nodeCount;
 
-        BuildBVHRecursive(verts, tris, centroids, triIndices,
-            0, triCount, nodeListA, nodeListB, reordered);
-
-        nodeA = nodeListA.ToArray();
-        nodeB = nodeListB.ToArray();
+        bvhNodes = nodes.ToArray();
+        bvhMeta = meta.ToArray();
         reorderedTris = reordered.ToArray();
 
-        GD.Print($"BVH: {nodeA.Length / 4} 节点, 叶子 {triCount} 三角形");
+        int leaves = 0, maxDepth = 0;
+        for (int i = 0; i < meta.Count / 4; i++)
+            if (meta[i * 4 + 3] > 0) leaves++;
+        // 深度用节点数估算（平衡中位数分割）
+        maxDepth = (int)Math.Ceiling(Math.Log2(Math.Max(triCount / (double)LEAF_SIZE, 1))) + 1;
+        GD.Print($"BVH: {bvhNodes.Length / 8} 节点 ({leaves} 叶), {reorderedTris.Length / 4} 三角形, 深度≈{maxDepth}");
     }
 
-    private static int BuildBVHRecursive(float[] verts, uint[] tris, float[] centroids,
-        int[] triIndices, int start, int count,
-        List<float> nodeA, List<float> nodeB, List<uint> reordered)
+    private static int BuildBVHRec(float[] verts, uint[] tris, float[] centroids,
+        int[] triIdx, int start, int count,
+        List<float> nodes, List<uint> meta, List<uint> reordered, int leafSize)
     {
-        int nodeIdx = nodeA.Count / 4;
-
-        // 计算三角形范围 AABB
+        // 本节点 AABB（三角形并集）
         float mnx = float.MaxValue, mny = float.MaxValue, mnz = float.MaxValue;
         float mxx = float.MinValue, mxy = float.MinValue, mxz = float.MinValue;
         for (int i = start; i < start + count; i++)
         {
-            int ti = triIndices[i];
+            int ti = triIdx[i];
             for (int v = 0; v < 3; v++)
             {
                 int vi = (int)tris[ti * 4 + v];
@@ -273,55 +269,47 @@ public static class MeshLoader
             }
         }
 
-        const int LEAF_SIZE = 4;
-        if (count <= LEAF_SIZE)
+        int self = nodes.Count / 8;
+
+        if (count <= leafSize)
         {
-            // 叶节点
-            int firstTri = reordered.Count / 4;
+            uint firstTri = (uint)(reordered.Count / 4);
             for (int i = start; i < start + count; i++)
             {
-                int ti = triIndices[i];
+                int ti = triIdx[i];
                 reordered.Add(tris[ti * 4]);
                 reordered.Add(tris[ti * 4 + 1]);
                 reordered.Add(tris[ti * 4 + 2]);
                 reordered.Add(tris[ti * 4 + 3]);
             }
-            nodeA.Add(mnx); nodeA.Add(mny); nodeA.Add(mnz); nodeA.Add(firstTri);
-            nodeB.Add(mxx); nodeB.Add(mxy); nodeB.Add(mxz); nodeB.Add(count);
-            return nodeIdx;
+            nodes.Add(mnx); nodes.Add(mny); nodes.Add(mnz); nodes.Add(0);
+            nodes.Add(mxx); nodes.Add(mxy); nodes.Add(mxz); nodes.Add(0);
+            meta.Add(0xFFFFFFFFu); meta.Add(0xFFFFFFFFu);  // left, right = NIL
+            meta.Add(firstTri); meta.Add((uint)count);
+            return self;
         }
 
-        // 内部节点：最长轴中位数分割
+        // 最长轴中位数分割（质心排序）
         float ex = mxx - mnx, ey = mxy - mny, ez = mxz - mnz;
         int axis = ex > ey && ex > ez ? 0 : (ey > ez ? 1 : 2);
-
-        // 按质心排序
-        int mid = start + count / 2;
-        Array.Sort(triIndices, start, count, Comparer<int>.Create((a, b) =>
+        Array.Sort(triIdx, start, count, Comparer<int>.Create((a, b) =>
             centroids[a * 3 + axis].CompareTo(centroids[b * 3 + axis])));
-        // 重新定位 mid（Array.Sort 排的是 triIndices[start..start+count)）
+        int mid = start + count / 2;
 
-        // 先占位（子节点索引需要回填）
-        int placeholderIdx = nodeA.Count / 4;
-        nodeA.Add(0); nodeA.Add(0); nodeA.Add(0); nodeA.Add(0);
-        nodeB.Add(0); nodeB.Add(0); nodeB.Add(0); nodeB.Add(0);
+        // 占位（AABB 已知可先写，子索引后回填）
+        nodes.Add(mnx); nodes.Add(mny); nodes.Add(mnz); nodes.Add(0);
+        nodes.Add(mxx); nodes.Add(mxy); nodes.Add(mxz); nodes.Add(0);
+        meta.Add(0); meta.Add(0); meta.Add(0); meta.Add(0);
 
-        int leftChild = BuildBVHRecursive(verts, tris, centroids, triIndices,
-            start, mid - start, nodeA, nodeB, reordered);
-        int rightChild = BuildBVHRecursive(verts, tris, centroids, triIndices,
-            mid, start + count - mid, nodeA, nodeB, reordered);
+        int left = BuildBVHRec(verts, tris, centroids, triIdx, start, mid - start,
+            nodes, meta, reordered, leafSize);
+        int right = BuildBVHRec(verts, tris, centroids, triIdx, mid, start + count - mid,
+            nodes, meta, reordered, leafSize);
+        meta[self * 4 + 0] = (uint)left;
+        meta[self * 4 + 1] = (uint)right;
+        // 内部节点 triCount = 0
 
-        // 回填：nodeA.w = 左子索引，nodeB.w = -(右子索引+1)（负数=内部节点）
-        nodeA[placeholderIdx * 4 + 0] = mnx;
-        nodeA[placeholderIdx * 4 + 1] = mny;
-        nodeA[placeholderIdx * 4 + 2] = mnz;
-        nodeA[placeholderIdx * 4 + 3] = leftChild;
-        nodeB[placeholderIdx * 4 + 0] = mxx;
-        nodeB[placeholderIdx * 4 + 1] = mxy;
-        nodeB[placeholderIdx * 4 + 2] = mxz;
-        nodeB[placeholderIdx * 4 + 3] = -(rightChild + 1); // 负数编码区分叶节点
-
-        return placeholderIdx;
+        return self;
     }
 
     // ---- OBJ 材质名 → 引擎材质映射 ----
@@ -389,6 +377,9 @@ public static class MeshLoader
                 else Set(i, 0.05f, 0.10f, 0.70f, 0.18f, 0, 0, 0, 0);
             }
             // 默认：用 MTL 的 Kd 颜色，中等粗糙度
+            else if (Math.Max(kd[0], Math.Max(kd[1], kd[2])) < 0.06f)
+                // 纯黑 Kd + 高光泽（如刀身/镡的 Ns 600-1000）→ 暗钢金属（有反光而非死黑）
+                Set(i, 0.24f, 0.25f, 0.27f, 0.18f, 0, 0, 0, 1);
             else
                 Set(i, kd[0], kd[1], kd[2], 0.6f, 0, 0, 0, 0);
         }

@@ -14,6 +14,17 @@ const uint CAUSTICS_RES = 256u;
 const float PI = 3.14159265359;
 const float INF = 1e30;
 
+// ---- 三角网格 BVH（绑定 11-15，由包含本文件的着色器共享）------------------
+// 节点 i: bvhNodes[2i].xyz=min / bvhNodes[2i+1].xyz=max
+//         bvhMeta[i]=(left,right,firstTri,triCount)；left=0xFFFFFFFF=空
+// 叶子 triCount>0；内部节点 triCount=0
+layout(set = 0, binding = 11, std430) readonly buffer MeshVertBuf { vec4 meshVerts[]; };
+layout(set = 0, binding = 12, std430) readonly buffer BvhNodeBuf { vec4 bvhNodes[]; };
+layout(set = 0, binding = 13, std430) readonly buffer BvhMetaBuf { uvec4 bvhMeta[]; };
+layout(set = 0, binding = 14, std430) readonly buffer BvhTriBuf  { uvec4 bvhTris[]; };
+layout(set = 0, binding = 15, std430) readonly buffer MeshMatBuf { vec4 meshMats[]; };
+const uint BVH_NIL = 0xFFFFFFFFu;
+
 // 球体材质类型（albedo.w）
 const float SMAT_DIFFUSE = 0.0;
 const float SMAT_METAL   = 1.0;
@@ -29,6 +40,111 @@ const uint MAT_POOLTILE = 4u;
 // ---- 工具 ----------------------------------------------------------------
 ivec3 worldSize() { return ivec3(int(P.uPoolWorld.z), int(P.uPoolWorld.w), int(P.uMisc.x)); }
 vec3 safeDir(vec3 d) { return mix(d, vec3(1e-10), lessThan(abs(d), vec3(1e-10))); }
+
+// ---- 三角网格 BVH 遍历 ----------------------------------------------------
+// Möller-Trumbore：返回 t，未命中返回 -1
+float triIntersect(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2) {
+    vec3 e1 = v1 - v0, e2 = v2 - v0;
+    vec3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (abs(det) < 1e-10) return -1.0;
+    float invDet = 1.0 / det;
+    vec3 tv = ro - v0;
+    float u = dot(tv, pv) * invDet;
+    if (u < 0.0 || u > 1.0) return -1.0;
+    vec3 qv = cross(tv, e1);
+    float v = dot(rd, qv) * invDet;
+    if (v < 0.0 || u + v > 1.0) return -1.0;
+    return dot(e2, qv) * invDet;
+}
+
+// BVH 最近命中（栈遍历）。空网格时根 AABB 退化 → 永不命中。
+bool traceMesh(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nHit, out uint matHit) {
+    tHit = tmax; nHit = vec3(0, 1, 0); matHit = 0u;
+    if (bvhMeta.length() < 1u) return false;
+    vec3 invD = 1.0 / safeDir(rd);
+    int bestTri = -1;
+    int stack[48];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int n = stack[--sp];
+        uvec4 meta = bvhMeta[n];
+        vec3 mn = bvhNodes[n * 2].xyz, mx = bvhNodes[n * 2 + 1].xyz;
+        vec3 ta = (mn - ro) * invD, tb = (mx - ro) * invD;
+        vec3 tmn = min(ta, tb), tmx = max(ta, tb);
+        float tN = max(max(tmn.x, tmn.y), tmn.z);
+        float tF = min(min(tmx.x, tmx.y), tmx.z);
+        if (tN > tF || tF < 0.0 || tN > tHit) continue;
+        if (meta.w > 0u) {
+            uint end = meta.z + meta.w;
+            for (uint ti = meta.z; ti < end; ti++) {
+                uvec4 tri = bvhTris[ti];
+                vec3 v0 = meshVerts[tri.x].xyz;
+                vec3 v1 = meshVerts[tri.y].xyz;
+                vec3 v2 = meshVerts[tri.z].xyz;
+                float t = triIntersect(ro, rd, v0, v1, v2);
+                if (t > 1e-4 && t < tHit) { tHit = t; bestTri = int(ti); }
+            }
+        } else {
+            // 先压远子树再压近子树（栈 LIFO → 近子树先出，更快收紧 tHit）
+            int nearN = int(meta.x), farN = int(meta.y);
+            if (farN != int(BVH_NIL)) {
+                vec3 mnF = bvhNodes[farN * 2].xyz, mxF = bvhNodes[farN * 2 + 1].xyz;
+                vec3 taF = (mnF - ro) * invD, tbF = (mxF - ro) * invD;
+                float tNF = max(max(min(taF.x, tbF.x), min(taF.y, tbF.y)), min(taF.z, tbF.z));
+                float tFF = min(min(max(taF.x, tbF.x), max(taF.y, tbF.y)), max(taF.z, tbF.z));
+                if (tNF <= tFF && tFF >= 0.0 && tNF < tHit && sp < 48) stack[sp++] = farN;
+            }
+            if (nearN != int(BVH_NIL) && sp < 48) stack[sp++] = nearN;
+        }
+    }
+    if (bestTri < 0) return false;
+    uvec4 tri = bvhTris[bestTri];
+    vec3 v0 = meshVerts[tri.x].xyz;
+    vec3 v1 = meshVerts[tri.y].xyz;
+    vec3 v2 = meshVerts[tri.z].xyz;
+    nHit = normalize(cross(v1 - v0, v2 - v0));
+    if (dot(nHit, rd) > 0.0) nHit = -nHit;
+    matHit = tri.w;
+    return true;
+}
+
+// 阴影射线遮挡测试（任一命中即遮挡；玻璃材质放行——染色交给介质路径）
+bool meshOccludes(vec3 ro, vec3 rd, float dist) {
+    if (bvhMeta.length() < 1u) return false;
+    vec3 invD = 1.0 / safeDir(rd);
+    int stack[48];
+    int sp = 0;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int n = stack[--sp];
+        uvec4 meta = bvhMeta[n];
+        vec3 mn = bvhNodes[n * 2].xyz, mx = bvhNodes[n * 2 + 1].xyz;
+        vec3 ta = (mn - ro) * invD, tb = (mx - ro) * invD;
+        vec3 tmn = min(ta, tb), tmx = max(ta, tb);
+        float tN = max(max(tmn.x, tmn.y), tmn.z);
+        float tF = min(min(tmx.x, tmx.y), tmx.z);
+        if (tN > tF || tF < 0.0 || tN > dist) continue;
+        if (meta.w > 0u) {
+            uint end = meta.z + meta.w;
+            for (uint ti = meta.z; ti < end; ti++) {
+                uvec4 tri = bvhTris[ti];
+                // 玻璃（type=3）不遮挡阴影
+                if (tri.w * 2u + 1u < uint(meshMats.length())) {
+                    if (meshMats[tri.w * 2u + 1u].w > 2.5) continue;
+                }
+                float t = triIntersect(ro, rd, meshVerts[tri.x].xyz,
+                                       meshVerts[tri.y].xyz, meshVerts[tri.z].xyz);
+                if (t > 1e-4 && t < dist) return true;
+            }
+        } else {
+            if (meta.y != BVH_NIL && sp < 48) stack[sp++] = int(meta.y);
+            if (meta.x != BVH_NIL && sp < 48) stack[sp++] = int(meta.x);
+        }
+    }
+    return false;
+}
 
 // 程序化水面波纹法线：迭代分形波（多倍频方向旋转 + 时间流动）。
 // 借鉴 yaohai-epic 水面着色器的迭代言波思路：exp(sin-1) 非对称波形，
@@ -459,6 +575,8 @@ int traceScene(vec3 ro, inout vec3 rd, inout vec3 throughput, inout uint seed,
 // ---- 阴影射线透过率：穿过水/玻璃按 Beer-Lambert 染色（彩色投影的来源）-----
 // 遇不透明体素返回 vec3(0)；纯空气路径返回 vec3(1)。
 vec3 shadowTransmittance(vec3 ro, vec3 rd, float dist) {
+    // 三角网格遮挡（玻璃网格三角形放行，染色交给折射路径）
+    if (meshOccludes(ro, rd, dist)) return vec3(0.0);
     float tEnter, tExit;
     if (!worldEnter(ro, rd, tEnter, tExit)) return vec3(1.0);
     if (tEnter > dist) return vec3(1.0);

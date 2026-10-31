@@ -285,14 +285,16 @@ public partial class Main : Node
             string objPath = candidates.FirstOrDefault(p => System.IO.File.Exists(p));
             if (objPath != null)
             {
+                // 绕 Y 转 90°：刀架长轴从 Z 转到 X，正对默认相机（否则只能看到刀的端面）
+                const float rotY = 90f;
                 MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
-                    out _, out _, out _, out _, out var mn, out var mx);
+                    out _, out _, out _, out _, out var mn, out var mx, rotY);
                 var size = mx - mn;
                 float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
                 float scale = 20f / Mathf.Max(longest, 0.01f);
                 var center = (mn + mx) * 0.5f * scale;
                 var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
-                _pt.LoadMesh(objPath, scale, offset);
+                _pt.LoadMesh(objPath, scale, offset, rotY);
             }
         }
 

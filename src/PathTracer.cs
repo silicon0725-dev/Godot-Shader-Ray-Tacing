@@ -23,9 +23,8 @@ public partial class PathTracer : IDisposable
     private Rid _lumBuf, _exposureBuf;            // 自动曝光
     private Rid _emissiveBuf;                     // 发光体素列表（解析 NEE 面光源）
     private uint _emissiveCount = 0;
-    // 三角网格（车）
+    // 三角网格（BVH 版）
     private Rid _meshVertBuf, _meshTriBuf, _meshBvhABuf, _meshBvhBBuf, _meshMatBuf;
-    private Rid _meshGridInfoBuf, _meshGridCellsBuf, _meshGridTrisBuf;
     private bool _hasMesh = false;
     private Rid _frameTex, _posTex;               // 时间重投影：本帧样本/主命中位置
     private Rid _histA, _histB;                   // 历史双缓冲（ping-pong）
@@ -255,37 +254,39 @@ public partial class PathTracer : IDisposable
     public uint EmissiveCount => _emissiveCount;
     public bool HasMesh => _hasMesh;
 
-    /// <summary>加载 OBJ 三角网格（顶点/三角形/BVH/材质）上传 GPU</summary>
-    public void LoadMesh(string objPath, float scale, Vector3 offset)
+    /// <summary>加载 OBJ 三角网格（顶点/BVH/材质）上传 GPU</summary>
+    public void LoadMesh(string objPath, float scale, Vector3 offset, float rotYDeg = 0f)
     {
         MeshLoader.LoadObj(objPath, scale, offset,
-            out var verts, out var tris, out _, out var matNames, out var meshMin, out var meshMax);
-        // 用均匀网格替代 BVH（简单可靠）
-        MeshLoader.BuildGrid(verts, tris, out var gridInfo, out var gridCells, out var gridTris);
+            out var verts, out var tris, out _, out var matNames, out var meshMin, out var meshMax,
+            rotYDeg);
+        // BVH（uint 索引版）：全量三角形无抽稀，每射线仅 ~40 次 AABB 测试
+        MeshLoader.BuildBVH(verts, tris, out var bvhNodes, out var bvhMeta, out var bvhTris);
         // MTL 路径 = OBJ 同名 .mtl
         var mtlPath = System.IO.Path.ChangeExtension(objPath, ".mtl");
         var meshMats = MeshLoader.BuildMeshMaterials(matNames, mtlPath);
 
         if (_meshVertBuf.IsValid) _rd.FreeRid(_meshVertBuf);
-        if (_meshGridTrisBuf.IsValid) _rd.FreeRid(_meshGridTrisBuf);
-        if (_meshGridInfoBuf.IsValid) _rd.FreeRid(_meshGridInfoBuf);
-        if (_meshGridCellsBuf.IsValid) _rd.FreeRid(_meshGridCellsBuf);
+        if (_meshBvhABuf.IsValid) _rd.FreeRid(_meshBvhABuf);
+        if (_meshBvhBBuf.IsValid) _rd.FreeRid(_meshBvhBBuf);
+        if (_meshTriBuf.IsValid) _rd.FreeRid(_meshTriBuf);
         if (_meshMatBuf.IsValid) _rd.FreeRid(_meshMatBuf);
 
         _meshVertBuf = MakeStorageBuffer(FloatsToBytes(verts));
-        // 网格三角形：uint 字节
-        var gtBytes = new byte[gridTris.Length * 4];
-        System.Buffer.BlockCopy(gridTris, 0, gtBytes, 0, gtBytes.Length);
-        _meshGridTrisBuf = MakeStorageBuffer(gtBytes);
-        _meshGridInfoBuf = MakeStorageBuffer(FloatsToBytes(gridInfo));
-        _meshGridCellsBuf = MakeStorageBuffer(FloatsToBytes(gridCells));
+        // BVH 节点 AABB（float）+ 元数据/三角形（uint）
+        _meshBvhABuf = MakeStorageBuffer(FloatsToBytes(bvhNodes));
+        var metaBytes = new byte[bvhMeta.Length * 4];
+        System.Buffer.BlockCopy(bvhMeta, 0, metaBytes, 0, metaBytes.Length);
+        _meshBvhBBuf = MakeStorageBuffer(metaBytes);
+        var triBytes = new byte[bvhTris.Length * 4];
+        System.Buffer.BlockCopy(bvhTris, 0, triBytes, 0, triBytes.Length);
+        _meshTriBuf = MakeStorageBuffer(triBytes);
         _meshMatBuf = MakeStorageBuffer(FloatsToBytes(meshMats));
 
         _hasMesh = true;
         RebuildSets();   // pathSet 需要新绑定
-        GD.Print($"网格车已加载: {verts.Length / 4} 顶点, {gridTris.Length / 4} 三角形 (均匀网格)");
-        GD.Print($"  gridInfo: min=({gridInfo[0]:F2},{gridInfo[1]:F2},{gridInfo[2]:F2}) cell={gridInfo[3]:F4}");
-        GD.Print($"  覆盖范围: ({gridInfo[0]:F1}→{gridInfo[0]+gridInfo[3]*64:F1}, {gridInfo[1]:F1}→{gridInfo[1]+gridInfo[3]*64:F1}, {gridInfo[2]:F1}→{gridInfo[2]+gridInfo[3]*64:F1})");
+        GD.Print($"网格模型已加载: {verts.Length / 4} 顶点, {bvhTris.Length / 4} 三角形 (BVH)");
+        GD.Print($"  世界包围盒: ({meshMin.X:F1},{meshMin.Y:F1},{meshMin.Z:F1}) → ({meshMax.X:F1},{meshMax.Y:F1},{meshMax.Z:F1})");
     }
 
     /// <summary>预制光照：排定 N 轮烘焙迭代（每帧最多跑 4 轮）</summary>
@@ -320,15 +321,16 @@ public partial class PathTracer : IDisposable
             U(RenderingDevice.UniformType.Image, 8, _frameTex),
             U(RenderingDevice.UniformType.Image, 9, _posTex),
             U(RenderingDevice.UniformType.StorageBuffer, 10, _emissiveBuf),
-            // 三角网格（车）：占位缓冲保证绑定有效，LoadMesh 后替换
+            // 三角网格（BVH）：占位缓冲保证绑定有效，LoadMesh 后替换
+            // 11=顶点 12=节点AABB(float) 13=节点元数据(uint) 14=重排三角形(uint) 15=材质
             U(RenderingDevice.UniformType.StorageBuffer, 11,
               _meshVertBuf.IsValid ? _meshVertBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 12,
-              _meshGridTrisBuf.IsValid ? _meshGridTrisBuf : MakeStorageBuffer(new byte[16])),
+              _meshBvhABuf.IsValid ? _meshBvhABuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 13,
-              _meshGridInfoBuf.IsValid ? _meshGridInfoBuf : MakeStorageBuffer(new byte[16])),
+              _meshBvhBBuf.IsValid ? _meshBvhBBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 14,
-              _meshGridCellsBuf.IsValid ? _meshGridCellsBuf : MakeStorageBuffer(new byte[16])),
+              _meshTriBuf.IsValid ? _meshTriBuf : MakeStorageBuffer(new byte[16])),
             U(RenderingDevice.UniformType.StorageBuffer, 15,
               _meshMatBuf.IsValid ? _meshMatBuf : MakeStorageBuffer(new byte[16])),
         });
@@ -373,6 +375,17 @@ public partial class PathTracer : IDisposable
             bakeGiU,
             U(RenderingDevice.UniformType.Image, 7, _giCacheTex),
             U(RenderingDevice.UniformType.StorageBuffer, 10, _emissiveBuf),
+            // 网格 BVH（bake 的 shadowTransmittance 经 meshOccludes 引用）
+            U(RenderingDevice.UniformType.StorageBuffer, 11,
+              _meshVertBuf.IsValid ? _meshVertBuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 12,
+              _meshBvhABuf.IsValid ? _meshBvhABuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 13,
+              _meshBvhBBuf.IsValid ? _meshBvhBBuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 14,
+              _meshTriBuf.IsValid ? _meshTriBuf : MakeStorageBuffer(new byte[16])),
+            U(RenderingDevice.UniformType.StorageBuffer, 15,
+              _meshMatBuf.IsValid ? _meshMatBuf : MakeStorageBuffer(new byte[16])),
         });
 
         // 时间重投影（两个方向的 ping-pong set 各建一份，运行时切换）
