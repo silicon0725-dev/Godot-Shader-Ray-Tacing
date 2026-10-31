@@ -17,7 +17,8 @@ public static class MeshLoader
     public static void BuildGrid(float[] verts, uint[] tris,
         out float[] gridInfo, out float[] gridCells, out uint[] gridTris)
     {
-        const int G = 32;
+        const int G = 64;   // 加密到 64³（细长模型如武士刀需要更细格子）
+        const int MAX_PER_CELL = 10000;  // 单格上限（防 GPU 超时）
         int triCount = tris.Length / 4;
 
         // 包围盒：只从三角形的顶点算（过滤后的实际范围，不含背景幕顶点）
@@ -55,16 +56,22 @@ public static class MeshLoader
             cellCount[cellOf[t]]++;
         }
 
+        // 截断过密格子（防 GPU 超时）
+        for (int i = 0; i < G * G * G; i++)
+            cellCount[i] = Math.Min(cellCount[i], MAX_PER_CELL);
+
         // 前缀和 → 每格起始位置
         var cellStart = new int[G * G * G + 1];
         for (int i = 0; i < G * G * G; i++) cellStart[i + 1] = cellStart[i] + cellCount[i];
 
-        // 填充重排三角形
+        // 填充重排三角形（截断后总数）
+        int totalKept = cellStart[G * G * G];
         var fill = new int[G * G * G];
-        gridTris = new uint[triCount * 4];
+        gridTris = new uint[totalKept * 4];
         for (int t = 0; t < triCount; t++)
         {
             int ci = cellOf[t];
+            if (fill[ci] >= cellCount[ci]) continue;  // 截断：跳过超额三角形
             int dst = cellStart[ci] + fill[ci]++;
             Array.Copy(tris, t * 4, gridTris, dst * 4, 4);
         }
@@ -175,17 +182,19 @@ public static class MeshLoader
         triMats = matList.ToArray();
         matNames = matNameList.ToArray();
 
-        // 包围盒
+        // 包围盒：只从被三角形实际引用的顶点计算（排除杂散/背景顶点）
         meshMin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
         meshMax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-        for (int i = 0; i < vertCount; i++)
+        var usedVerts = new HashSet<int>();
+        for (int i = 0; i < faceList.Count; i++) usedVerts.Add((int)faceList[i]);
+        foreach (int vi in usedVerts)
         {
-            meshMin.X = Math.Min(meshMin.X, verts[i * 4]);
-            meshMin.Y = Math.Min(meshMin.Y, verts[i * 4 + 1]);
-            meshMin.Z = Math.Min(meshMin.Z, verts[i * 4 + 2]);
-            meshMax.X = Math.Max(meshMax.X, verts[i * 4]);
-            meshMax.Y = Math.Max(meshMax.Y, verts[i * 4 + 1]);
-            meshMax.Z = Math.Max(meshMax.Z, verts[i * 4 + 2]);
+            meshMin.X = Math.Min(meshMin.X, verts[vi * 4]);
+            meshMin.Y = Math.Min(meshMin.Y, verts[vi * 4 + 1]);
+            meshMin.Z = Math.Min(meshMin.Z, verts[vi * 4 + 2]);
+            meshMax.X = Math.Max(meshMax.X, verts[vi * 4]);
+            meshMax.Y = Math.Max(meshMax.Y, verts[vi * 4 + 1]);
+            meshMax.Z = Math.Max(meshMax.Z, verts[vi * 4 + 2]);
         }
 
         GD.Print($"OBJ 加载: {vertCount} 顶点, {triCount} 三角形, {matNames.Length} 材质");
