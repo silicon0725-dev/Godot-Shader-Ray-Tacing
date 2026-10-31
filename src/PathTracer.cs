@@ -317,7 +317,13 @@ public partial class PathTracer : IDisposable
         byte[] px = { 128, 128, 255, 255 };
         if (pngPath != null)
         {
-            var img = Image.LoadFromFile(pngPath);
+            var bytes = FileAccess.GetFileAsBytes(pngPath);
+            Image img = null;
+            if (bytes.Length > 0)
+            {
+                img = new Image();
+                if (img.LoadPngFromBuffer(bytes) != Error.Ok) img = null;
+            }
             if (img != null)
             {
                 img.Convert(Image.Format.Rgba8);

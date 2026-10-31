@@ -282,7 +282,10 @@ public partial class Main : Node
         else if (index == 3)
         {
             _world.BuildShowroomMesh();
-            LoadMeshPreset(@"F:\光线追踪\katana_model\katana.obj", rotYDeg: 90f);
+            // res:// 优先（编辑器+导出 exe 通用），本地源路径兜底
+            LoadMeshPreset(FirstExisting(
+                "res://assets/katana/katana.obj",
+                @"F:\光线追踪\katana_model\katana.obj"), rotYDeg: 90f);
         }
         else if (index == 4)
         {
@@ -290,12 +293,12 @@ public partial class Main : Node
             // Blender decimate 低模在 GPU 上碎裂（CPU 自检一致却渲染错乱，未解），
             // 法线贴图管线保留：VOXELLOWBUG=1 切回低模实验路线
             _world.BuildShowroomMesh();
-            var assetDir = @"F:\光线追踪\VoxelPoolGodot\assets\bugatti_rt";
             bool low = System.Environment.GetEnvironmentVariable("VOXELLOWBUG") == "1";
-            string obj = low ? System.IO.Path.Combine(assetDir, "bugatti_low.obj")
-                             : System.IO.Path.Combine(assetDir, "bugatti.obj");
+            string obj = low ? FirstExisting("res://assets/bugatti_rt/bugatti_low.obj")
+                             : FirstExisting("res://assets/bugatti_rt/bugatti.obj",
+                                             @"F:\光线追踪\car_model\bugatti\bugatti.obj");
             LoadMeshPreset(obj, rotYDeg: 90f,
-                normalMapPath: low ? System.IO.Path.Combine(assetDir, "bugatti_normal.png") : null);
+                normalMapPath: low ? "res://assets/bugatti_rt/bugatti_normal.png" : null);
         }
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
@@ -308,10 +311,22 @@ public partial class Main : Node
         _sampleIdx = 0;
     }
 
+    /// <summary>路径存在性检查（res:// 与普通路径双兼容）</summary>
+    private static bool PathExists(string p) =>
+        p.StartsWith("res://") ? FileAccess.FileExists(p) : System.IO.File.Exists(p);
+
+    /// <summary>返回第一个存在的候选路径（res:// 优先）</summary>
+    private static string FirstExisting(params string[] candidates)
+    {
+        foreach (var c in candidates)
+            if (PathExists(c)) return c;
+        return candidates[0];
+    }
+
     /// <summary>加载网格模型预设：自动缩放到 20 单位、落地居中 (16,·,16)</summary>
     private void LoadMeshPreset(string objPath, float rotYDeg = 0f, string normalMapPath = null)
     {
-        if (!System.IO.File.Exists(objPath))
+        if (!PathExists(objPath))
         {
             ShowStatus($"找不到模型: {objPath}");
             return;

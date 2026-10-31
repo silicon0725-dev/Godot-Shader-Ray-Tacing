@@ -20,6 +20,27 @@ public static class MeshLoader
             || n == "none" || n.Contains("alight") || n.Contains("backdrop");
     }
 
+    // ---- 行读取：res://（编辑器=项目目录，导出=pck 内）与普通路径双兼容 ----
+    // 不存在时返回空序列（MTL 可选）
+    private static IEnumerable<string> ReadObjLines(string path)
+    {
+        if (path.StartsWith("res://"))
+        {
+            var f = Godot.FileAccess.Open(path, Godot.FileAccess.ModeFlags.Read);
+            if (f == null) yield break;
+            using (f)
+            {
+                while (!f.EofReached())
+                    yield return f.GetLine();
+            }
+        }
+        else
+        {
+            if (!File.Exists(path)) yield break;
+            foreach (var l in File.ReadLines(path)) yield return l;
+        }
+    }
+
     // ---- OBJ 解析 ----
     public static void LoadObj(string path, float scale, Vector3 offset,
         out float[] verts, out uint[] tris, out uint[] triMats,
@@ -40,7 +61,7 @@ public static class MeshLoader
         bool _skipCurrent = false;
         if (!matIdMap.ContainsKey("default")) { matIdMap["default"] = 0; matNameList.Add("default"); }
 
-        foreach (var line in File.ReadLines(path))
+        foreach (var line in ReadObjLines(path))
         {
             if (line.StartsWith("v "))
             {
@@ -496,12 +517,13 @@ public static class MeshLoader
         float tPaint = normalMap ? 5f : 0f;
         // 解析 MTL 文件获取 Kd 颜色
         var mtlKd = new Dictionary<string, float[]>();
-        if (mtlPath != null && File.Exists(mtlPath))
+        if (mtlPath != null)
         {
             string cur = null;
-            foreach (var line in File.ReadLines(mtlPath))
+            foreach (var line in ReadObjLines(mtlPath))
             {
                 var p = line.Trim().Split(' ');
+                if (p.Length == 0 || p[0].Length == 0) continue;
                 if (p[0] == "newmtl" && p.Length > 1) cur = p[1];
                 else if (p[0] == "Kd" && p.Length >= 4 && cur != null)
                     mtlKd[cur] = new[] { float.Parse(p[1]), float.Parse(p[2]), float.Parse(p[3]) };

@@ -36,7 +36,8 @@ present.glsl     累积平均 → 曝光 → filmic tonemap → gamma → rgba8
 | WASD / Space / Ctrl | 移动 / 上升 / 下降（Shift 加速） |
 | 左键 / 右键 | 删除 / 放置体素（准星处） |
 | T | 切换放置材质（含 7 色玻璃砖） |
-| 1 / 2 | 泳池 / 康奈尔盒预设 |
+| 1 / 2 / 3 | 泳池 / 康奈尔盒 / 后室预设 |
+| 4 / 5 | 网格模型展厅：武士刀（53 万三角形）/ 布加迪（147 万三角形） |
 | R | 重置相机 |
 
 ## 彩色玻璃体素
@@ -56,9 +57,24 @@ shaders/  pathtrace.glsl   路径追踪主 shader
 src/      PathTracer.cs    RenderingDevice 管线封装
           VoxelWorld.cs    体素数据 + 预设场景 + CPU DDA 拾取
           FlyCamera.cs     飞行相机
+          MeshLoader.cs    OBJ 解析 + BVH 构建（uint 索引）
           Main.cs          主控
+assets/   katana/          武士刀 OBJ（按键 4）
+          bugatti_rt/      布加迪 OBJ + Blender decimate 低模 + 2K 法线贴图（按键 5）
+tools/    bugatti_*.py     Blender headless 资产管线（decimate/UV/法线烘焙）
 scenes/   main.tscn
 ```
+
+### 三角网格光追（按键 4/5）
+
+OBJ 全量三角形加载 → CPU 中位数分割 BVH（子树索引存独立 uint 缓冲）→
+GPU 栈遍历（近子树先出 + 远子树 AABB 预筛）→ 阴影射线同样走 BVH
+（模型投真实软影）。布加迪 147 万三角形在 Intel 核显上 ~12fps。
+法线贴图管线：LoadObj 解析 vt + (v,vt) 顶点膨胀，traceMesh 命中后
+按材质 type 4/5 采样切线空间法线贴图扰动法线（几何边重建切线基）。
+
+> 布加迪原始 OBJ（84MB）不入库；放入 `assets/bugatti_rt/bugatti.obj`
+> 即可在源码模式下使用按键 5。导出的 exe 已内置全部资产。
 
 ## 与原作对应的技术点
 
