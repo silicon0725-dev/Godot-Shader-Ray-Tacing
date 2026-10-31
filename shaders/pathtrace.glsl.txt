@@ -58,7 +58,7 @@ layout(set = 0, binding = 15, std430) readonly buffer MeshMatBuf  { vec4 meshMat
 // ---- 三角网格求交（均匀网格 DDA + Möller-Trumbore）-------------------------
 bool traceMesh(vec3 ro, vec3 rd, float tmax, out float tHit, out vec3 nHit, out uint matHit) {
     vec4 info = meshGridInfo[0];  // minX minY minZ cellSize
-    const int G = 32;
+    const int G = 16;
     vec3 gMin = info.xyz;
     float cell = info.w;
     vec3 gMax = gMin + cell * float(G);

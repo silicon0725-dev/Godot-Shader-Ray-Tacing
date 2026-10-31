@@ -17,8 +17,8 @@ public static class MeshLoader
     public static void BuildGrid(float[] verts, uint[] tris,
         out float[] gridInfo, out float[] gridCells, out uint[] gridTris)
     {
-        const int G = 32;   // 32³ 网格（64³ 太密导致 GPU 超时）
-        const int MAX_PER_CELL = 2000;  // 单格上限 2000（防 GPU 超时）
+        const int G = 16;   // 粗网格（每射线只穿 ~16 格，大幅减少总工作量）
+        const int MAX_PER_CELL = 500;  // 单格上限（500×16格=8000次求交/像素，iGPU 可承受）
         int triCount = tris.Length / 4;
 
         // 包围盒：只从三角形的顶点算（过滤后的实际范围，不含背景幕顶点）
@@ -40,21 +40,37 @@ public static class MeshLoader
         float cell = Math.Max(Math.Max(mxx - mnx, mxy - mny), mxz - mnz) / G;
         cell = Math.Max(cell, 0.01f);
 
-        // 质心 → 格子索引
-        var cellOf = new int[triCount];
+        // 空间分裂：三角形插入其 AABB 覆盖的所有格子（薄物体不再挤一格）
+        var entries = new List<(int cell, int tri)>(triCount * 2);
         var cellCount = new int[G * G * G];
         for (int t = 0; t < triCount; t++)
         {
             int v0 = (int)tris[t * 4], v1 = (int)tris[t * 4 + 1], v2 = (int)tris[t * 4 + 2];
-            float cx = (verts[v0 * 4] + verts[v1 * 4] + verts[v2 * 4]) / 3;
-            float cy = (verts[v0 * 4 + 1] + verts[v1 * 4 + 1] + verts[v2 * 4 + 1]) / 3;
-            float cz = (verts[v0 * 4 + 2] + verts[v1 * 4 + 2] + verts[v2 * 4 + 2]) / 3;
-            int gx = Math.Clamp((int)((cx - mnx) / cell), 0, G - 1);
-            int gy = Math.Clamp((int)((cy - mny) / cell), 0, G - 1);
-            int gz = Math.Clamp((int)((cz - mnz) / cell), 0, G - 1);
-            cellOf[t] = gx + gy * G + gz * G * G;
-            cellCount[cellOf[t]]++;
+            // 三角形 AABB
+            float tmnx = Math.Min(verts[v0*4], Math.Min(verts[v1*4], verts[v2*4]));
+            float tmny = Math.Min(verts[v0*4+1], Math.Min(verts[v1*4+1], verts[v2*4+1]));
+            float tmnz = Math.Min(verts[v0*4+2], Math.Min(verts[v1*4+2], verts[v2*4+2]));
+            float tmxx = Math.Max(verts[v0*4], Math.Max(verts[v1*4], verts[v2*4]));
+            float tmxy = Math.Max(verts[v0*4+1], Math.Max(verts[v1*4+1], verts[v2*4+1]));
+            float tmxz = Math.Max(verts[v0*4+2], Math.Max(verts[v1*4+2], verts[v2*4+2]));
+            int x0 = Math.Clamp((int)((tmnx - mnx) / cell), 0, G - 1);
+            int y0 = Math.Clamp((int)((tmny - mny) / cell), 0, G - 1);
+            int z0 = Math.Clamp((int)((tmnz - mnz) / cell), 0, G - 1);
+            int x1 = Math.Clamp((int)((tmxx - mnx) / cell), 0, G - 1);
+            int y1 = Math.Clamp((int)((tmxy - mny) / cell), 0, G - 1);
+            int z1 = Math.Clamp((int)((tmxz - mnz) / cell), 0, G - 1);
+            for (int gz = z0; gz <= z1; gz++)
+                for (int gy = y0; gy <= y1; gy++)
+                    for (int gx = x0; gx <= x1; gx++)
+                    {
+                        int ci = gx + gy * G + gz * G * G;
+                        entries.Add((ci, t));
+                        cellCount[ci]++;
+                    }
         }
+        // 截断
+        for (int i = 0; i < G * G * G; i++)
+            cellCount[i] = Math.Min(cellCount[i], MAX_PER_CELL);
 
         // 截断过密格子（防 GPU 超时）
         for (int i = 0; i < G * G * G; i++)
@@ -64,14 +80,14 @@ public static class MeshLoader
         var cellStart = new int[G * G * G + 1];
         for (int i = 0; i < G * G * G; i++) cellStart[i + 1] = cellStart[i] + cellCount[i];
 
-        // 填充重排三角形（截断后总数）
+        // 填充重排三角形（空间分裂条目按格子排序后填充，截断超额）
+        entries.Sort((a, b) => a.cell.CompareTo(b.cell));
         int totalKept = cellStart[G * G * G];
         var fill = new int[G * G * G];
         gridTris = new uint[totalKept * 4];
-        for (int t = 0; t < triCount; t++)
+        foreach (var (ci, t) in entries)
         {
-            int ci = cellOf[t];
-            if (fill[ci] >= cellCount[ci]) continue;  // 截断：跳过超额三角形
+            if (fill[ci] >= cellCount[ci]) continue;  // 截断
             int dst = cellStart[ci] + fill[ci]++;
             Array.Copy(tris, t * 4, gridTris, dst * 4, 4);
         }

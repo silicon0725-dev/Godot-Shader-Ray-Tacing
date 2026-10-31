@@ -277,7 +277,23 @@ public partial class Main : Node
         else if (index == 2) _world.BuildBackrooms();
         else if (index == 3)
         {
-            _world.BuildShowroom();   // 体素车版展厅（稳定可靠）
+            _world.BuildShowroomMesh();
+            string[] candidates = {
+                @"F:\光线追踪\katana_model\katana.obj",
+                @"F:\光线追踪\car_model\bugatti\bugatti.obj",
+            };
+            string objPath = candidates.FirstOrDefault(p => System.IO.File.Exists(p));
+            if (objPath != null)
+            {
+                MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
+                    out _, out _, out _, out _, out var mn, out var mx);
+                var size = mx - mn;
+                float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
+                float scale = 20f / Mathf.Max(longest, 0.01f);
+                var center = (mn + mx) * 0.5f * scale;
+                var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
+                _pt.LoadMesh(objPath, scale, offset);
+            }
         }
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
