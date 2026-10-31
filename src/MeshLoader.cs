@@ -17,8 +17,8 @@ public static class MeshLoader
     public static void BuildGrid(float[] verts, uint[] tris,
         out float[] gridInfo, out float[] gridCells, out uint[] gridTris)
     {
-        const int G = 64;   // 加密到 64³（细长模型如武士刀需要更细格子）
-        const int MAX_PER_CELL = 10000;  // 单格上限（防 GPU 超时）
+        const int G = 32;   // 32³ 网格（64³ 太密导致 GPU 超时）
+        const int MAX_PER_CELL = 2000;  // 单格上限 2000（防 GPU 超时）
         int triCount = tris.Length / 4;
 
         // 包围盒：只从三角形的顶点算（过滤后的实际范围，不含背景幕顶点）

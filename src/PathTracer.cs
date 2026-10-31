@@ -283,7 +283,9 @@ public partial class PathTracer : IDisposable
 
         _hasMesh = true;
         RebuildSets();   // pathSet 需要新绑定
-        GD.Print($"网格车已加载: {verts.Length / 4} 顶点, {gridTris.Length / 4} 三角形 (32³均匀网格)");
+        GD.Print($"网格车已加载: {verts.Length / 4} 顶点, {gridTris.Length / 4} 三角形 (均匀网格)");
+        GD.Print($"  gridInfo: min=({gridInfo[0]:F2},{gridInfo[1]:F2},{gridInfo[2]:F2}) cell={gridInfo[3]:F4}");
+        GD.Print($"  覆盖范围: ({gridInfo[0]:F1}→{gridInfo[0]+gridInfo[3]*64:F1}, {gridInfo[1]:F1}→{gridInfo[1]+gridInfo[3]*64:F1}, {gridInfo[2]:F1}→{gridInfo[2]+gridInfo[3]*64:F1})");
     }
 
     /// <summary>预制光照：排定 N 轮烘焙迭代（每帧最多跑 4 轮）</summary>
