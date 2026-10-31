@@ -262,7 +262,9 @@ public partial class PathTracer : IDisposable
             out var verts, out var tris, out _, out var matNames, out var meshMin, out var meshMax);
         // 用均匀网格替代 BVH（简单可靠）
         MeshLoader.BuildGrid(verts, tris, out var gridInfo, out var gridCells, out var gridTris);
-        var meshMats = MeshLoader.BuildMeshMaterials(matNames);
+        // MTL 路径 = OBJ 同名 .mtl
+        var mtlPath = System.IO.Path.ChangeExtension(objPath, ".mtl");
+        var meshMats = MeshLoader.BuildMeshMaterials(matNames, mtlPath);
 
         if (_meshVertBuf.IsValid) _rd.FreeRid(_meshVertBuf);
         if (_meshGridTrisBuf.IsValid) _rd.FreeRid(_meshGridTrisBuf);

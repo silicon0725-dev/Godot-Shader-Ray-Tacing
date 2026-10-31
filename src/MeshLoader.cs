@@ -301,8 +301,23 @@ public static class MeshLoader
 
     // ---- OBJ 材质名 → 引擎材质映射 ----
     // 返回 float[]: 每材质 8 个 float (albedo.xyz+rough, emission.xyz+type)
-    public static float[] BuildMeshMaterials(string[] matNames)
+    // type: 0=漫反射 1=金属 2=发光 3=玻璃
+    public static float[] BuildMeshMaterials(string[] matNames, string mtlPath = null)
     {
+        // 解析 MTL 文件获取 Kd 颜色
+        var mtlKd = new Dictionary<string, float[]>();
+        if (mtlPath != null && File.Exists(mtlPath))
+        {
+            string cur = null;
+            foreach (var line in File.ReadLines(mtlPath))
+            {
+                var p = line.Trim().Split(' ');
+                if (p[0] == "newmtl" && p.Length > 1) cur = p[1];
+                else if (p[0] == "Kd" && p.Length >= 4 && cur != null)
+                    mtlKd[cur] = new[] { float.Parse(p[1]), float.Parse(p[2]), float.Parse(p[3]) };
+            }
+        }
+
         var mats = new float[Math.Max(matNames.Length, 1) * 8];
         void Set(int id, float r, float g, float b, float rough,
                  float er, float eg, float eb, float type)
@@ -311,32 +326,46 @@ public static class MeshLoader
             mats[id * 8 + 0] = r; mats[id * 8 + 1] = g; mats[id * 8 + 2] = b; mats[id * 8 + 3] = rough;
             mats[id * 8 + 4] = er; mats[id * 8 + 5] = eg; mats[id * 8 + 6] = eb; mats[id * 8 + 7] = type;
         }
+
         for (int i = 0; i < matNames.Length; i++)
         {
             string n = matNames[i].ToLower();
+            var kd = mtlKd.TryGetValue(matNames[i], out var c) ? c : new[] { 0.5f, 0.5f, 0.5f };
+
             if (n == "default") { Set(i, 0.5f, 0.5f, 0.5f, 0.8f, 0, 0, 0, 0); continue; }
+
+            // 玻璃
             if (n.Contains("glass") || n.Contains("window") || n.Contains("wind"))
-                Set(i, 0.06f, 0.06f, 0.06f, 0, 0, 0, 0, 2);  // 玻璃（albedo=σ）
+                Set(i, 0.06f, 0.06f, 0.06f, 0, 0, 0, 0, 3);
+            // 发光
             else if (n.Contains("tail") || n.Contains("brak"))
-                Set(i, 0, 0, 0, 1, 3.0f, 0.1f, 0.05f, 2);     // 红尾灯
+                Set(i, 0, 0, 0, 1, 3.0f, 0.1f, 0.05f, 2);
             else if ((n.Contains("light") || n.Contains("head") || n.Contains("lamp")) && !n.Contains("studio"))
-                Set(i, 0, 0, 0, 1, 4.0f, 3.8f, 3.2f, 2);       // 白前灯
-            else if (n.Contains("studio") || n.Contains("back") || n.Contains("drop") || n.Contains("floor") || n.Contains("sun") || n.Contains("none") || n.Contains("curtain"))
-                Set(i, 0.1f, 0.1f, 0.1f, 1, 0, 0, 0, 0);       // 背景/棚（深灰吸收）
-            else if (n.Contains("tire") || n.Contains("tyre") || n.Contains("rubber") || n.Contains("wheel") || n.Contains("rim"))
-                Set(i, 0.07f, 0.07f, 0.08f, 0.95f, 0, 0, 0, 0); // 轮胎
-            else if (n.Contains("chrome") || n.Contains("grill") || n.Contains("metal") || n.Contains("engine")
-                  || n.Contains("trim") || n.Contains("silver") || n.Contains("nut") || n.Contains("mirror"))
-                Set(i, 0.92f, 0.92f, 0.95f, 0.06f, 0, 0, 0, 1); // 镀铬/金属
+                Set(i, 0, 0, 0, 1, 4.0f, 3.8f, 3.2f, 2);
+            // 背景/棚 → 深灰吸收
+            else if (n.Contains("studio") || n.Contains("back") || n.Contains("drop")
+                  || n.Contains("floor") || n.Contains("sun") || n == "none" || n.Contains("curtain"))
+                Set(i, 0.1f, 0.1f, 0.1f, 1, 0, 0, 0, 0);
+            // 金属/镀铬（含中文：刀头=刀刃，环=金属环，金色材质）
+            else if (n.Contains("chrome") || n.Contains("grill") || n.Contains("metal")
+                  || n.Contains("engine") || n.Contains("trim") || n.Contains("silver")
+                  || n.Contains("nut") || n.Contains("mirror")
+                  || n.Contains("刀头") || n.Contains("环") || n.Contains("blade")
+                  || (kd[0] > 0.8f && kd[1] > 0.6f && kd[2] < 0.1f))  // 金色 Kd → 金属
+                Set(i, kd[0], kd[1], kd[2], 0.08f, 0, 0, 0, 1);
+            // 轮胎/黑色粗糙
+            else if (n.Contains("tire") || n.Contains("tyre") || n.Contains("rubber")
+                  || n.Contains("wheel") || n.Contains("rim"))
+                Set(i, 0.07f, 0.07f, 0.08f, 0.95f, 0, 0, 0, 0);
+            // 车漆/光泽表面（含中文材质.005/.006/.007 → 用 Kd 颜色）
             else if (n.Contains("navy") || n.Contains("body") || n.Contains("paint") || n.Contains("blue"))
             {
-                if (n.Contains("navy"))
-                    Set(i, 0.04f, 0.05f, 0.10f, 0.18f, 0, 0, 0, 0);  // 藏青漆
-                else
-                    Set(i, 0.05f, 0.10f, 0.70f, 0.18f, 0, 0, 0, 0);  // 蓝漆
+                if (n.Contains("navy")) Set(i, 0.04f, 0.05f, 0.10f, 0.18f, 0, 0, 0, 0);
+                else Set(i, 0.05f, 0.10f, 0.70f, 0.18f, 0, 0, 0, 0);
             }
+            // 默认：用 MTL 的 Kd 颜色，中等粗糙度
             else
-                Set(i, 0.4f, 0.4f, 0.42f, 0.7f, 0, 0, 0, 0);    // 默认灰
+                Set(i, kd[0], kd[1], kd[2], 0.6f, 0, 0, 0, 0);
         }
         return mats;
     }

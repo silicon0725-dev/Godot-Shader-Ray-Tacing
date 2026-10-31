@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using Godot;
 
 namespace VoxelPoolGodot;
@@ -277,10 +278,27 @@ public partial class Main : Node
         else if (index == 3)
         {
             _world.BuildShowroomMesh();
-            // 加载完整 OBJ 网格车（本地路径，不入 Git）
-            string objPath = @"F:\光线追踪\car_model\bugatti\bugatti.obj";
-            if (System.IO.File.Exists(objPath))
-                _pt.LoadMesh(objPath, 1.8f, new Vector3(16f, 1.0f, 16f));
+            // 加载 OBJ 网格模型：优先武士刀，回退到布加迪
+            string[] candidates = {
+                @"F:\光线追踪\katana_model\katana.obj",
+                @"F:\光线追踪\katana_model\无标题.obj",
+                @"F:\光线追踪\car_model\bugatti\bugatti.obj",
+            };
+            string objPath = candidates.FirstOrDefault(p => System.IO.File.Exists(p));
+            if (objPath != null)
+            {
+                // 自动缩放：先探测模型包围盒，再计算缩放使其最长边 = 20 体素
+                MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
+                    out _, out _, out _, out _, out var mn, out var mx);
+                var size = mx - mn;
+                float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
+                float scale = 20f / longest;
+                // 中心对齐 (16, ?, 16)，底部放 y=1（地板面）
+                var center = (mn + mx) * 0.5f * scale;
+                var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
+                _pt.LoadMesh(objPath, scale, offset);
+                GD.Print($"模型自动缩放: {longest:F1}→20, scale={scale:F3}, offset={offset}");
+            }
         }
         else _world.BuildShowroom();
 
