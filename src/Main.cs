@@ -96,7 +96,7 @@ public partial class Main : Node
             "点击画面捕获鼠标 | ESC 释放\n" +
             "WASD 移动 / Space 上升 / Ctrl 下降 / Shift 加速\n" +
             "左键 删除方块 | 右键 放置方块 | T 切换材质\n" +
-            "1 泳池 | 2 康奈尔盒 | 3 后室 | 4 展厅 | R 重置相机 | M 水面动画\n" +
+            "1 泳池 | 2 康奈尔盒 | 3 后室 | 4 体素展厅 | R 重置 | M 动画\n" +
             "F5 保存 | F9 读取 | E 自动曝光 | PageUp/Down 渲染比例\n" +
             "[ ] 太阳高度 | - = 太阳方位（黄昏/夜晚有星空）";
 
@@ -277,30 +277,8 @@ public partial class Main : Node
         else if (index == 2) _world.BuildBackrooms();
         else if (index == 3)
         {
-            _world.BuildShowroomMesh();
-            // 加载 OBJ 网格模型：优先武士刀，回退到布加迪
-            string[] candidates = {
-                @"F:\光线追踪\katana_model\katana.obj",
-                @"F:\光线追踪\katana_model\无标题.obj",
-                @"F:\光线追踪\car_model\bugatti\bugatti.obj",
-            };
-            string objPath = candidates.FirstOrDefault(p => System.IO.File.Exists(p));
-            if (objPath != null)
-            {
-                // 自动缩放：先探测模型包围盒，再计算缩放使其最长边 = 20 体素
-                MeshLoader.LoadObj(objPath, 1.0f, Vector3.Zero,
-                    out _, out _, out _, out _, out var mn, out var mx);
-                var size = mx - mn;
-                float longest = Mathf.Max(Mathf.Max(size.X, size.Y), size.Z);
-                float scale = 20f / longest;
-                // 中心对齐 (16, ?, 16)，底部放 y=1（地板面）
-                var center = (mn + mx) * 0.5f * scale;
-                var offset = new Vector3(16f - center.X, 1.0f - mn.Y * scale, 16f - center.Z);
-                _pt.LoadMesh(objPath, scale, offset);
-                GD.Print($"模型自动缩放: {longest:F1}→20, scale={scale:F3}, offset={offset}");
-            }
+            _world.BuildShowroom();   // 体素车版展厅（稳定可靠）
         }
-        else _world.BuildShowroom();
 
         _pt.SetScene(_world.PackVoxels(), _world.PackSpheres(), _world.BuildMaterialBuffer());
         _pt.ResetExposure(_world.Scene.Exposure);
